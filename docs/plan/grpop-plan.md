@@ -15,6 +15,8 @@
 
 **No message broker/queue sits between a caller and the vendor in v1 — every send is direct and synchronous.** See §4.4 and §9 item 4 for the full reasoning and what the extension point looks like if that changes later.
 
+**Retry expiry (this update):** `DLQHandler` retries are now bounded by a hard wall-clock deadline (`ExpiresAt`), not just a retry-count ceiling — once that deadline passes, an event stops being retried at all, regardless of how many `MaxRetries` attempts remain unused. See §4.6 for the full design and §9 item 12 for the reasoning: a password-reset link or invite token is itself time-boxed, and retrying a send past that point just delivers a dead link.
+
 **Package shape: single flat package, no subpackages** — see §3.
 
 ---
@@ -218,6 +220,15 @@ type SendOptions struct {
 	IdempotencyKey string        // caller-supplied; empty disables the idempotency check — see §9
 	IdempotencyTTL time.Duration // 0 uses ServiceConfig's configured default
 	SkipRateLimit  bool          // escape hatch, e.g. an admin-triggered manual resend
+
+	// RetryExpiresAt is the hard wall-clock deadline after which grpop
+	// stops retrying a failed send entirely — see §4.6. Zero value uses
+	// ServiceConfig.DefaultMaxRetryAge, measured from the first failure,
+	// not from this call. Callers who know their own message's real
+	// expiry (a password-reset link's TTL, an invite token's expiry)
+	// should set this explicitly rather than relying on the library
+	// default — see §9 item 12.
+	RetryExpiresAt time.Time
 }
 ```
 
@@ -305,6 +316,8 @@ type Service interface {
 
 **Is there a message broker in between, or does `grpop` send directly? Direct, in v1 — no broker.** `SendEmail`/`SendWhatsApp` call the vendor (SMTP relay / Meta Graph API) synchronously on the caller's own goroutine, with an inline Full-Jitter retry (`retrystrategy.go`) for transient per-call failures, and only fall through to `DLQHandler.PublishToDLQ` once those inline retries are exhausted. There is no producer/consumer split, no queue a message sits in between "caller asked for a send" and "vendor call happened." This matches all four ERP use cases (§2) exactly: each is a synchronous HTTP request/response flow where the handler wants (or at least logs) the outcome of the send in the same request, not "enqueue and move on."
 
+When a send does fall through to the DLQ, `Service` computes the `DLQMessage.ExpiresAt` it publishes with (§4.6) as `opts.RetryExpiresAt` if the caller set one, otherwise `time.Now().Add(cfg.DefaultMaxRetryAge)` — a new `ServiceConfig.DefaultMaxRetryAge` field (proposed default: `24 * time.Hour`, flagged as a judgment call in §9 item 12) that only matters when a caller doesn't supply a more precise deadline of their own.
+
 **What a broker *could* be used for, if this changes:** the natural extension point is exactly the one `grnoti` already proved — an `EventConsumer`-shaped adapter (`Start(ctx, handler func(context.Context, Event) error) error`) that calls `Service.SendEmail`/`SendWhatsApp` as its handler, composing purely through matching function signatures with zero import coupling into `service.go` itself. Candidate brokers for that adapter, if/when it's built (none chosen or implemented in v1 — see §9 item 4):
 - **Kafka** — the most directly relevant option since `skipp.app.erp.golang.backend` already has a live Kafka connection today that nothing currently publishes to; `grnoti`'s own `consumer.kafka.go` (built on `github.com/IBM/sarama`) is the exact, already-proven pattern to copy if this is wired up later.
 - **Redis Streams** — lower operational overhead than Kafka if the only reason for a queue is "smooth out a burst of invite-sends," and `grpop` already depends on Redis for the distributed rate limiter, so no new infrastructure would be needed, only a new client usage.
@@ -323,28 +336,108 @@ type IdempotencyStore interface {
 
 Implementation is the single `NewCacheIdempotencyStore(cache grcache.Cache) IdempotencyStore` adapter (§1.3).
 
-### 4.6 `DLQHandler` — atomic-claim, channel-tagged (SMS field removed)
+### 4.6 `DLQHandler` — atomic-claim, channel-tagged, with a hard retry-expiry deadline
 
 ```go
+// DLQStatus is a terminal-or-in-flight state for one DLQEvent.
+type DLQStatus string
+
+const (
+	DLQStatusPending   DLQStatus = "pending"
+	DLQStatusRetrying  DLQStatus = "retrying"
+	DLQStatusResolved  DLQStatus = "resolved"
+	DLQStatusExhausted DLQStatus = "exhausted" // RetryCount reached MaxRetries
+	DLQStatusExpired   DLQStatus = "expired"   // ExpiresAt passed before a successful retry —
+	                                           // see the note below distinguishing this from
+	                                           // PurgeExpiredEvents' unrelated use of "expired"
+)
+
 // DLQMessage is a channel-tagged envelope — exactly one of Email/WhatsApp
 // is non-nil, matching Channel.
 type DLQMessage struct {
 	Channel  Channel
 	Email    *EmailMessage
 	WhatsApp *WhatsAppMessage
+
+	// ExpiresAt is the hard wall-clock deadline after which this event
+	// stops being retried at all, regardless of remaining RetryCount
+	// budget — set by Service from SendOptions.RetryExpiresAt or
+	// ServiceConfig.DefaultMaxRetryAge (§4.4) before PublishToDLQ is
+	// called. New in this revision: previously retries were bounded only
+	// by MaxRetries, with no time-based cutoff at all.
+	ExpiresAt time.Time
+}
+
+// DLQEvent is the durable record of one failed send, awaiting retry or
+// already Resolved/Exhausted/Expired.
+type DLQEvent struct {
+	SendID         string
+	MessageData    DLQMessage // carries Channel and ExpiresAt
+	FailureReason  string
+	RetryCount     int
+	MaxRetries     int
+	FirstFailureAt time.Time
+	LastAttemptAt  time.Time
+	NextRetryAt    time.Time
+	Status         DLQStatus
+	AttemptHistory []DLQRetryAttempt
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 
 type DLQHandler interface {
 	PublishToDLQ(ctx context.Context, sendID string, msg DLQMessage, failureReason string) error
+
+	// ClaimRetryableEvents does two things, in order, each call:
+	//  1. Proactively transitions any DLQStatusPending event whose
+	//     msg.ExpiresAt has already passed to DLQStatusExpired — a plain
+	//     bulk UPDATE, not part of the atomic-claim step below, since it
+	//     needs no cross-replica coordination. Without this step, an
+	//     event whose deadline passes while nothing happens to call
+	//     ClaimRetryableEvents for it would sit invisibly in Pending
+	//     forever instead of surfacing as a terminal, dashboard-visible
+	//     state.
+	//  2. Atomically selects up to limit of the remaining events whose
+	//     NextRetryAt has passed, Status is still DLQStatusPending, and
+	//     ExpiresAt is still in the future, transitioning each to
+	//     DLQStatusRetrying as part of the same operation — so N
+	//     concurrent worker replicas each claim disjoint events. Postgres:
+	//     one UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED)
+	//     RETURNING * statement, with an added "AND expires_at > now()"
+	//     predicate (§6). Mongo: loops findOneAndUpdate per document.
 	ClaimRetryableEvents(ctx context.Context, limit int) ([]*DLQEvent, error)
+
+	// MarkRetried records a retry attempt's outcome and transitions
+	// sendID out of DLQStatusRetrying: to DLQStatusResolved on success;
+	// to DLQStatusExpired if the recomputed NextRetryAt (on a failure
+	// with retries remaining) would land at or past msg.ExpiresAt — this
+	// check runs before the MaxRetries check, so a message that expires
+	// with retry budget still unused is reported as Expired, not
+	// Exhausted; to DLQStatusExhausted if RetryCount reaches MaxRetries
+	// (and ExpiresAt hasn't passed); otherwise back to DLQStatusPending
+	// with the recomputed NextRetryAt. Returns ErrDLQEventNotClaimed if
+	// sendID is not currently DLQStatusRetrying.
 	MarkRetried(ctx context.Context, sendID string, success bool, attemptErr error) error
+
 	GetEventByID(ctx context.Context, sendID string) (*DLQEvent, error)
+
+	// PurgeExpiredEvents deletes DLQStatusResolved/DLQStatusExhausted/
+	// DLQStatusExpired events, and any event older than maxAge regardless
+	// of status. Its name predates this revision's new DLQStatusExpired
+	// status and refers to a different sense of "expired" (old enough to
+	// clean up), not the retry-deadline concept above — despite the
+	// naming overlap, the two are unrelated: an event can be
+	// DLQStatusExpired (gave up retrying) for a long time before
+	// PurgeExpiredEvents(ctx, maxAge) actually deletes its row.
 	PurgeExpiredEvents(ctx context.Context, maxAge time.Duration) (int64, error)
+
 	Close() error
 }
 ```
 
 No background reclaim loop inside `grpop` itself — `ClaimRetryableEvents` is a primitive a consuming application's own periodic worker/cron calls. **This is the closest thing to a "queue" that exists in v1** — a durable, pull-based retry table in Postgres/Mongo, not a broker: nothing pushes a claimed event anywhere, a caller's own process polls for work.
+
+**Why a deadline independent of `MaxRetries` at all:** a retry-count ceiling alone assumes every failure is equally worth retrying no matter how much wall-clock time has passed — true for a generic delivery failure, but not for `grpop`'s actual payloads. A password-reset link or invite token is itself time-boxed (the token expires, independent of `grpop`); retrying a send for five more hours past that point doesn't help the recipient, it just spends vendor-call budget and rate-limit headroom delivering a message that's already useless. `ExpiresAt` lets the caller (or the library default) say "don't bother past this point," and `DLQStatusExpired` makes that outcome visible and distinguishable from `DLQStatusExhausted` (a real, possibly-alertable vendor-side problem) in dashboards/queries.
 
 ### 4.7 `RateLimiter` — per-recipient AND per-channel (unchanged design, now over 2 channels)
 
@@ -462,7 +555,12 @@ CREATE TABLE IF NOT EXISTS grpop_dlq (
     first_failure_at TIMESTAMPTZ NOT NULL,
     last_attempt_at TIMESTAMPTZ NOT NULL,
     next_retry_at TIMESTAMPTZ NOT NULL,
-    status VARCHAR(32) NOT NULL,           -- string enum, not a Postgres ENUM type
+    expires_at TIMESTAMPTZ NOT NULL,        -- NEW (§4.6): hard retry cutoff, independent of
+                                            -- retry_count/max_retries — set from
+                                            -- SendOptions.RetryExpiresAt or
+                                            -- ServiceConfig.DefaultMaxRetryAge at PublishToDLQ time
+    status VARCHAR(32) NOT NULL,           -- string enum, not a Postgres ENUM type; now includes
+                                            -- 'expired' alongside pending/retrying/resolved/exhausted
     attempt_history JSONB NOT NULL DEFAULT '[]',
     created_at TIMESTAMPTZ NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL
@@ -473,17 +571,40 @@ CREATE INDEX IF NOT EXISTS idx_grpop_dlq_status_next_retry
 
 CREATE INDEX IF NOT EXISTS idx_grpop_dlq_channel_status
     ON grpop_dlq (channel, status);
+
+-- NEW: supports ClaimRetryableEvents' bulk expire-sweep step (below) —
+-- finding all still-Pending rows whose deadline has passed without
+-- scanning the whole table.
+CREATE INDEX IF NOT EXISTS idx_grpop_dlq_status_expires_at
+    ON grpop_dlq (status, expires_at);
 ```
 
-Claim statement (unchanged):
+`ClaimRetryableEvents` now runs two statements every call, in order (§4.6):
 
 ```sql
+-- name: ExpirePastDeadlineEvents :exec
+-- Step 1: proactively transition any Pending row whose deadline has
+-- already passed to 'expired', regardless of whether this call's own
+-- `limit` will get to it below. Plain UPDATE, no FOR UPDATE SKIP LOCKED —
+-- multiple replicas running this concurrently is redundant but harmless
+-- (each row transitions once; a second attempt on an already-'expired'
+-- row matches zero rows), so no cross-replica coordination is needed here
+-- the way it is for the claim step.
+UPDATE grpop_dlq
+SET status = 'expired', updated_at = $2
+WHERE status = 'pending' AND expires_at <= $1;
+
 -- name: ClaimRetryableEvents :many
+-- Step 2: the original claim, with an added "AND expires_at > $1" so a
+-- row can never be claimed for retry past its own deadline — this
+-- predicate is what actually enforces the cutoff; step 1 above only
+-- exists so an event that nobody claims in time still surfaces as
+-- 'expired' instead of sitting silently in 'pending' forever.
 UPDATE grpop_dlq
 SET status = 'retrying', updated_at = $2
 WHERE send_id IN (
     SELECT send_id FROM grpop_dlq
-    WHERE status = 'pending' AND next_retry_at <= $1
+    WHERE status = 'pending' AND next_retry_at <= $1 AND expires_at > $1
     ORDER BY next_retry_at
     LIMIT $3
     FOR UPDATE SKIP LOCKED
@@ -499,7 +620,7 @@ RETURNING *;
 - `Logger` interface + `NopLogger()`/`OrNop()`, verbatim `grnoti` shape.
 - Sentinel errors: `"grpop: message"` / `"grpop/<component>: ..."` sub-prefix; `errors.Is`-matched, no `IsX(err) bool` helpers.
 - `Close()` idempotent via `sync.Once` + `atomic.Bool`.
-- `docs.go`: godoc only, "Package shape" + "Precise, non-aspirational claims" sections (mirroring `grnoti/docs.go`) — now including a note that `SendStatusSent` means "SMTP relay/Meta API accepted it," never "arrived in an inbox/on a phone," that `TemplateValidator`'s cache means "approved as of the last check," not a live guarantee, and that **there is no message broker anywhere in this package** — `Service.SendX` is a direct, synchronous vendor call (§4.4).
+- `docs.go`: godoc only, "Package shape" + "Precise, non-aspirational claims" sections (mirroring `grnoti/docs.go`) — now including a note that `SendStatusSent` means "SMTP relay/Meta API accepted it," never "arrived in an inbox/on a phone," that `TemplateValidator`'s cache means "approved as of the last check," not a live guarantee, that **there is no message broker anywhere in this package** — `Service.SendX` is a direct, synchronous vendor call (§4.4) — and that `DLQStatusExpired` (§4.6) is a deadline-based cutoff wholly independent of `PurgeExpiredEvents`' unrelated "expired" (old-enough-to-delete) usage, despite the shared word.
 - Testing: real in-package `contract_*_test.go` files, real local Docker Postgres/Redis/Mongo/**Mailpit**, `t.Skip` when unreachable, `-race` mandatory. **Only** the Meta WhatsApp client is the documented fake-only exception now (§3, §4.3) — a first for a vendor-facing dispatcher in this ecosystem.
 - Shared dependency versions: `jackc/pgx/v5`, `go.mongodb.org/mongo-driver` (v1, not v2), `redis/go-redis/v9`, aligned to whatever `grcache`'s go.sum currently pins. **No vendor-messaging-SDK version to track at all**, and no message-broker client library version either — a direct consequence of the dependency-minimization goal.
 
@@ -513,13 +634,13 @@ RETURNING *;
 
 **Stage 2 — Pure in-process logic.** `retrystrategy.go`, `circuitbreaker.go`, `payloadvalidator.go`.
 
-**Stage 3 — `memory.go`: in-memory variants.** In-memory `DLQHandler` and fake `EmailSender`/`WhatsAppSender` for tests/local dev, no live service or vendor account needed.
+**Stage 3 — `memory.go`: in-memory variants.** In-memory `DLQHandler` (including the `ExpiresAt`/`DLQStatusExpired` deadline logic from §4.6 — the in-memory variant is the first place this state machine gets built and unit-tested, before Stage 6 repeats it in SQL) and fake `EmailSender`/`WhatsAppSender` for tests/local dev, no live service or vendor account needed.
 
 **Stage 4 — `cache.idempotency.go` + local `RateLimiter`.** The `grcache`-backed adapter (§4.5); `ratelimiter.go`'s local, bounded-LRU, per-(channel,recipient) token bucket (§4.7).
 
 **Stage 5 — `templateengine.email.go`.** `html/template`-based `EmailTemplateEngine` (§4.8).
 
-**Stage 6 — PostgreSQL: `postgres.go` + `dlq.postgres.go`.** Shared connect helper, schema-ensure + advisory lock, sqlc-generated `internal/postgresdb`, the atomic-claim `DLQHandler`.
+**Stage 6 — PostgreSQL: `postgres.go` + `dlq.postgres.go`.** Shared connect helper, schema-ensure + advisory lock, sqlc-generated `internal/postgresdb`, the atomic-claim `DLQHandler` — including the `expires_at` column, its index, the `ExpirePastDeadlineEvents`/`ClaimRetryableEvents` two-step sequence, and `MarkRetried`'s expiry-before-exhaustion check (§4.6, §6).
 
 **Stage 7 — MongoDB: `dlq.mongo.go`.** Alt `DLQHandler` backend.
 
@@ -558,6 +679,8 @@ Judgment calls, flagged rather than buried:
 9. **§4.10, new**: `TemplateValidator` is advisory and cache-backed, not a scheduled background refresh job inside `grpop` — a stale cache (Meta approves/rejects a template between `grpop`'s last check and a live send) means the pre-check can be wrong in either direction for up to the cache's TTL. This is accepted because the vendor call itself is still the ultimate source of truth (`Send` doesn't skip actually calling Meta just because the pre-check passed) — the validator only ever short-circuits an *already-known-bad* combination, it can't create a false negative that blocks a send that would have succeeded.
 10. **§4.11, new**: `DryRunSender` is a construction-time swap (choose it instead of the real dispatcher when building `ServiceDeps`), not a runtime flag on the real dispatchers — kept this way deliberately to avoid a `if dryRun { ... }` branch living inside otherwise-production dispatch code.
 11. **§1.2**: Twilio/Gupshup for WhatsApp, and any vendor-API email path (SES/SendGrid), are **explicitly deferred, not designed away** — both remain additive alt implementations behind the existing vendor-agnostic interfaces whenever a concrete need (BSP relationship, deliverability analytics) makes the added dependency worth it.
+12. **§4.6, new**: **`ServiceConfig.DefaultMaxRetryAge` defaults to `24 * time.Hour`** as the fallback retry deadline when a caller leaves `SendOptions.RetryExpiresAt` zero. This is a genuine guess, not derived from any of the four ERP use cases' actual token TTLs (which this plan doesn't know precisely — a password-reset token's real lifetime and an invite token's real lifetime are plausibly quite different from each other and from 24h). Flagged strongly: **callers should set `RetryExpiresAt` explicitly to match their own message's real expiry** rather than relying on the default — this is the same class of footgun as item 8's `IdempotencyKey`, and worth equal prominence in the README's quickstart (§10), not just the godoc. Revisit the default itself once the consuming team confirms real TTL values for both token types.
+13. **§4.6, new**: **`DLQStatusExpired` is checked before `DLQStatusExhausted` in `MarkRetried`.** A message whose deadline passes with retry budget still unused is reported as `Expired`, not `Exhausted` — these are different failure modes worth distinguishing in monitoring (`Exhausted` suggests a vendor-side problem worth alerting on; `Expired` suggests the message simply outlived its own usefulness, which is expected/benign behavior, not an incident). Stated as a judgment call because the two could have been collapsed into one terminal "gave up" status instead — kept separate specifically so a dashboard/alert can treat them differently without parsing `attempt_history`.
 
 ---
 
@@ -618,10 +741,15 @@ result, err := svc.SendEmail(ctx, grpop.EmailMessage{
 	To:           []string{recipientEmail},
 	TemplateName: "password-reset",
 	TemplateData: map[string]any{"ResetLink": link},
-}, grpop.SendOptions{IdempotencyKey: hashOf(token)})
+}, grpop.SendOptions{
+	IdempotencyKey: hashOf(token),
+	RetryExpiresAt: tokenExpiresAt, // the same expiry already computed for the reset token itself
+	                                // (§9 item 12) — don't rely on ServiceConfig's 24h default here,
+	                                // it won't generally match the real token TTL
+})
 ```
 
-`result.Status`/`result.ProviderMessageID` is the delivery-status handle the call site logs or surfaces; a failed send after inline retries is durably recorded in `grpop_dlq` for a separately-run reclaim worker to retry later — the call site itself never blocks on that retry, but it also never handed the send off to any broker to begin with (§4.4).
+`result.Status`/`result.ProviderMessageID` is the delivery-status handle the call site logs or surfaces; a failed send after inline retries is durably recorded in `grpop_dlq` (with that `RetryExpiresAt` as its `ExpiresAt`, §4.6) for a separately-run reclaim worker to retry later — the call site itself never blocks on that retry, but it also never handed the send off to any broker to begin with (§4.4), and the reclaim worker itself will stop retrying once `tokenExpiresAt` passes rather than continuing to deliver a link that's already dead.
 
 ---
 
