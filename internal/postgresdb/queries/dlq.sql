@@ -41,17 +41,22 @@ WHERE status = 'pending' AND expires_at <= $1;
 
 -- name: ClaimRetryableEvents :many
 -- Step 2 of ClaimRetryableEvents: single-statement atomic claim, extended
--- with "AND expires_at > $1" so a row can never be claimed for retry past
--- its own deadline — this predicate is what actually enforces the cutoff;
--- step 1 above only exists so an event nobody claims in time still
--- surfaces as 'expired' instead of sitting silently in 'pending' forever.
--- The inner SELECT ... FOR UPDATE SKIP LOCKED lets N concurrent callers
--- each lock a disjoint set of candidate rows without blocking each other.
+-- with "AND (expires_at IS NULL OR expires_at > $1)" so a row can never be
+-- claimed for retry past its own deadline — this predicate is what
+-- actually enforces the cutoff; step 1 above only exists so an event
+-- nobody claims in time still surfaces as 'expired' instead of sitting
+-- silently in 'pending' forever. A NULL expires_at ("no deadline") must be
+-- explicitly OR'd in — plain SQL comparison (NULL > $1) evaluates to NULL,
+-- not true, so it would otherwise silently exclude every no-deadline row
+-- from ever being claimed. The inner SELECT ... FOR UPDATE SKIP LOCKED
+-- lets N concurrent callers each lock a disjoint set of candidate rows
+-- without blocking each other.
 UPDATE grpop_dlq
 SET status = 'retrying', updated_at = $2
 WHERE send_id IN (
     SELECT candidate.send_id FROM grpop_dlq AS candidate
-    WHERE candidate.status = 'pending' AND candidate.next_retry_at <= $1 AND candidate.expires_at > $1
+    WHERE candidate.status = 'pending' AND candidate.next_retry_at <= $1
+        AND (candidate.expires_at IS NULL OR candidate.expires_at > $1)
     ORDER BY candidate.next_retry_at
     LIMIT $3
     FOR UPDATE SKIP LOCKED

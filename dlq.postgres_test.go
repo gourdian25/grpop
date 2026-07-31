@@ -239,11 +239,17 @@ func TestPostgresDLQHandler_MarkRetried_GoesBackToPending(t *testing.T) {
 func TestPostgresDLQHandler_MarkRetried_ExpiresBeforeExhausting(t *testing.T) {
 	h := newTestPostgresDLQHandler(t, 100, 0) // huge retry budget, retryDelay=0 so the initial claim below succeeds
 	ctx := context.Background()
-	msg := testDLQMessage(time.Now().Add(time.Millisecond))
+	// A generous margin (not 1ms) so the Publish+Claim round trip below
+	// reliably completes before the deadline passes — otherwise
+	// ClaimRetryableEvents' own expiry sweep can beat the claim to it,
+	// which is a timing flake, not the behavior this test exists to prove.
+	msg := testDLQMessage(time.Now().Add(100 * time.Millisecond))
 	_ = h.PublishToDLQ(ctx, "pge-expire", msg, "boom")
-	_, _ = h.ClaimRetryableEvents(ctx, 10)
+	if claimed, err := h.ClaimRetryableEvents(ctx, 10); err != nil || len(claimed) != 1 {
+		t.Fatalf("ClaimRetryableEvents() = (%v, %v), want exactly 1 claimed before its deadline", claimed, err)
+	}
 
-	time.Sleep(5 * time.Millisecond)
+	time.Sleep(150 * time.Millisecond)
 
 	if err := h.MarkRetried(ctx, "pge-expire", false, errors.New("still failing")); err != nil {
 		t.Fatalf("MarkRetried: %v", err)
@@ -280,6 +286,33 @@ func TestPostgresDLQHandler_ClaimRetryableEvents_SweepsExpiredPendingEvents(t *t
 	}
 	if got.Status != DLQStatusExpired {
 		t.Fatalf("Status after deadline sweep = %s, want %s", got.Status, DLQStatusExpired)
+	}
+}
+
+// TestPostgresDLQHandler_ZeroExpiresAt_NeverExpires proves a zero-value
+// ExpiresAt (only reachable by constructing a DLQMessage directly,
+// bypassing Service) is accepted (stored as SQL NULL, not rejected by a
+// NOT NULL constraint) and behaves as "no deadline": never swept to
+// Expired, and remains claimable indefinitely — matching
+// memoryDLQHandler's identical treatment of a zero ExpiresAt.
+func TestPostgresDLQHandler_ZeroExpiresAt_NeverExpires(t *testing.T) {
+	h := newTestPostgresDLQHandler(t, 3, 0)
+	ctx := context.Background()
+	msg := testDLQMessage(time.Time{}) // zero value: no deadline
+
+	if err := h.PublishToDLQ(ctx, "pge-no-deadline", msg, "boom"); err != nil {
+		t.Fatalf("PublishToDLQ(zero ExpiresAt): %v", err)
+	}
+
+	claimed, err := h.ClaimRetryableEvents(ctx, 10)
+	if err != nil {
+		t.Fatalf("ClaimRetryableEvents: %v", err)
+	}
+	if len(claimed) != 1 || claimed[0].SendID != "pge-no-deadline" {
+		t.Fatalf("ClaimRetryableEvents() = %v, want [pge-no-deadline] (a NULL deadline must not block claiming)", claimed)
+	}
+	if !claimed[0].MessageData.ExpiresAt.IsZero() {
+		t.Fatalf("MessageData.ExpiresAt = %v, want zero value round-tripped", claimed[0].MessageData.ExpiresAt)
 	}
 }
 

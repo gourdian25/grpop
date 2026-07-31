@@ -3,7 +3,6 @@
 package grpop
 
 import (
-	"container/list"
 	"context"
 	"errors"
 	"fmt"
@@ -24,16 +23,15 @@ const defaultRecipientCacheSize = 10000
 // default/dev RateLimiter. It limits calls made through this one instance
 // in this one process only: running N replicas of a service using it gives
 // N times the configured rate, not a shared global rate. See
-// ratelimiter.redis.go (Stage 9) for the distributed variant.
+// ratelimiter.redis.go for the distributed variant.
 //
 // "Two-tier" per RateLimiter's own doc comment: one bucket per Channel
 // (a small, fixed set — no eviction needed) AND one bucket per
 // (channel, recipient) pair, held in a bounded, least-recently-used cache
-// so unbounded recipient cardinality can't grow this structure without
-// limit. Both buckets share the same requestsPerSecond/burstSize
-// configuration; there is no separate tuning knob for the channel-level
-// vs. recipient-level rate today (see NewLocalRateLimiter's doc comment
-// if that turns out to matter later).
+// (stringKeyedLRU, lru.go) so unbounded recipient cardinality can't grow
+// this structure without limit. Both buckets share the same
+// requestsPerSecond/burstSize configuration; there is no separate tuning
+// knob for the channel-level vs. recipient-level rate today.
 //
 // A request is allowed only if BOTH tiers have capacity. Composing two
 // independent token buckets into one atomic allow/reject decision is the
@@ -50,16 +48,13 @@ type localRateLimiter struct {
 	mu              sync.Mutex
 	channelLimiters map[Channel]*rate.Limiter
 
-	recipientCapacity int
-	recipientItems    map[string]*list.Element
-	recipientOrder    *list.List // Front() = most recently used
+	recipients *stringKeyedLRU[*recipientLimiterEntry]
 }
 
 // recipientLimiterEntry is one (channel, recipient) bucket plus its own
 // stats — GetStats reports per-(channel,recipient), not process-wide, so
 // stats live here rather than on localRateLimiter itself.
 type recipientLimiterEntry struct {
-	key     string
 	limiter *rate.Limiter
 
 	mu            sync.Mutex
@@ -131,18 +126,17 @@ func NewLocalRateLimiter(requestsPerSecond, burstSize, recipientCacheSize int) (
 		recipientCacheSize = defaultRecipientCacheSize
 	}
 	return &localRateLimiter{
-		requestsPerSec:    requestsPerSecond,
-		burstSize:         burstSize,
-		channelLimiters:   make(map[Channel]*rate.Limiter),
-		recipientCapacity: recipientCacheSize,
-		recipientItems:    make(map[string]*list.Element),
-		recipientOrder:    list.New(),
+		requestsPerSec:  requestsPerSecond,
+		burstSize:       burstSize,
+		channelLimiters: make(map[Channel]*rate.Limiter),
+		recipients:      newStringKeyedLRU[*recipientLimiterEntry](recipientCacheSize),
 	}, nil
 }
 
-// channelLimiter returns channel's bucket, creating it if necessary. Called
-// with r.mu held.
+// channelLimiter returns channel's bucket, creating it if necessary.
 func (r *localRateLimiter) channelLimiter(channel Channel) *rate.Limiter {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	lim, ok := r.channelLimiters[channel]
 	if !ok {
 		lim = rate.NewLimiter(rate.Limit(r.requestsPerSec), r.burstSize)
@@ -151,42 +145,8 @@ func (r *localRateLimiter) channelLimiter(channel Channel) *rate.Limiter {
 	return lim
 }
 
-// getOrCreateRecipientEntry returns the (channel, recipient) bucket,
-// creating it (and evicting the least-recently-used entry if the cache is
-// now over capacity) if necessary. Marks the entry most-recently-used.
-// Called with r.mu held.
-func (r *localRateLimiter) getOrCreateRecipientEntry(channel Channel, recipient string) *recipientLimiterEntry {
-	key := string(channel) + "|" + recipient
-	if el, ok := r.recipientItems[key]; ok {
-		r.recipientOrder.MoveToFront(el)
-		return el.Value.(*recipientLimiterEntry)
-	}
-
-	entry := &recipientLimiterEntry{key: key, limiter: rate.NewLimiter(rate.Limit(r.requestsPerSec), r.burstSize)}
-	el := r.recipientOrder.PushFront(entry)
-	r.recipientItems[key] = el
-
-	for r.recipientOrder.Len() > r.recipientCapacity {
-		back := r.recipientOrder.Back()
-		if back == nil {
-			break
-		}
-		r.recipientOrder.Remove(back)
-		delete(r.recipientItems, back.Value.(*recipientLimiterEntry).key)
-	}
-	return entry
-}
-
-// peekRecipientEntry returns the (channel, recipient) bucket without
-// creating one or touching LRU order — used by GetStats so a mere
-// inspection can't evict a legitimately-tracked recipient to make room.
-// Called with r.mu held.
-func (r *localRateLimiter) peekRecipientEntry(channel Channel, recipient string) (*recipientLimiterEntry, bool) {
-	el, ok := r.recipientItems[string(channel)+"|"+recipient]
-	if !ok {
-		return nil, false
-	}
-	return el.Value.(*recipientLimiterEntry), true
+func recipientKey(channel Channel, recipient string) string {
+	return string(channel) + "|" + recipient
 }
 
 func (r *localRateLimiter) Allow(ctx context.Context, channel Channel, recipient string) (bool, error) {
@@ -194,10 +154,10 @@ func (r *localRateLimiter) Allow(ctx context.Context, channel Channel, recipient
 		return false, err
 	}
 
-	r.mu.Lock()
 	chLim := r.channelLimiter(channel)
-	entry := r.getOrCreateRecipientEntry(channel, recipient)
-	r.mu.Unlock()
+	entry := r.recipients.getOrCreate(recipientKey(channel, recipient), func() *recipientLimiterEntry {
+		return &recipientLimiterEntry{limiter: rate.NewLimiter(rate.Limit(r.requestsPerSec), r.burstSize)}
+	})
 
 	chRes := chLim.Reserve()
 	if !chRes.OK() {
@@ -225,10 +185,10 @@ func (r *localRateLimiter) Allow(ctx context.Context, channel Channel, recipient
 }
 
 func (r *localRateLimiter) Wait(ctx context.Context, channel Channel, recipient string) error {
-	r.mu.Lock()
 	chLim := r.channelLimiter(channel)
-	entry := r.getOrCreateRecipientEntry(channel, recipient)
-	r.mu.Unlock()
+	entry := r.recipients.getOrCreate(recipientKey(channel, recipient), func() *recipientLimiterEntry {
+		return &recipientLimiterEntry{limiter: rate.NewLimiter(rate.Limit(r.requestsPerSec), r.burstSize)}
+	})
 
 	entry.recordWait()
 
@@ -244,10 +204,7 @@ func (r *localRateLimiter) Wait(ctx context.Context, channel Channel, recipient 
 }
 
 func (r *localRateLimiter) GetStats(_ context.Context, channel Channel, recipient string) (RateLimiterStats, error) {
-	r.mu.Lock()
-	entry, ok := r.peekRecipientEntry(channel, recipient)
-	r.mu.Unlock()
-
+	entry, ok := r.recipients.peek(recipientKey(channel, recipient))
 	if !ok {
 		return RateLimiterStats{RequestsPerSecond: r.requestsPerSec, BurstSize: r.burstSize}, nil
 	}

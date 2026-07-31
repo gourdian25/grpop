@@ -10,7 +10,10 @@ CREATE TABLE IF NOT EXISTS grpop_dlq (
     first_failure_at TIMESTAMPTZ  NOT NULL,
     last_attempt_at  TIMESTAMPTZ  NOT NULL,
     next_retry_at    TIMESTAMPTZ  NOT NULL,
-    expires_at       TIMESTAMPTZ  NOT NULL,
+    expires_at       TIMESTAMPTZ,  -- NULL means "no deadline" — only reachable by constructing a
+                                    -- DLQMessage directly with a zero ExpiresAt, bypassing Service
+                                    -- (which always sets one); see ClaimRetryableEvents below and
+                                    -- DLQHandler's doc comment in interfaces.go
     status           VARCHAR(32)  NOT NULL,
     attempt_history  JSONB        NOT NULL DEFAULT '[]',
     created_at       TIMESTAMPTZ  NOT NULL,

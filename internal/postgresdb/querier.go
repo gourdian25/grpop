@@ -12,12 +12,16 @@ import (
 
 type Querier interface {
 	// Step 2 of ClaimRetryableEvents: single-statement atomic claim, extended
-	// with "AND expires_at > $1" so a row can never be claimed for retry past
-	// its own deadline — this predicate is what actually enforces the cutoff;
-	// step 1 above only exists so an event nobody claims in time still
-	// surfaces as 'expired' instead of sitting silently in 'pending' forever.
-	// The inner SELECT ... FOR UPDATE SKIP LOCKED lets N concurrent callers
-	// each lock a disjoint set of candidate rows without blocking each other.
+	// with "AND (expires_at IS NULL OR expires_at > $1)" so a row can never be
+	// claimed for retry past its own deadline — this predicate is what
+	// actually enforces the cutoff; step 1 above only exists so an event
+	// nobody claims in time still surfaces as 'expired' instead of sitting
+	// silently in 'pending' forever. A NULL expires_at ("no deadline") must be
+	// explicitly OR'd in — plain SQL comparison (NULL > $1) evaluates to NULL,
+	// not true, so it would otherwise silently exclude every no-deadline row
+	// from ever being claimed. The inner SELECT ... FOR UPDATE SKIP LOCKED
+	// lets N concurrent callers each lock a disjoint set of candidate rows
+	// without blocking each other.
 	ClaimRetryableEvents(ctx context.Context, arg ClaimRetryableEventsParams) ([]GrpopDlq, error)
 	// Step 1 of ClaimRetryableEvents: proactively transition any Pending row
 	// whose deadline has already passed to 'expired', regardless of whether

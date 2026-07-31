@@ -789,10 +789,15 @@ CREATE TABLE IF NOT EXISTS grpop_dlq (
     first_failure_at TIMESTAMPTZ NOT NULL,
     last_attempt_at TIMESTAMPTZ NOT NULL,
     next_retry_at TIMESTAMPTZ NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,        -- NEW (§4.6): hard retry cutoff, independent of
+    expires_at TIMESTAMPTZ,                 -- NEW (§4.6): hard retry cutoff, independent of
                                             -- retry_count/max_retries — set from
                                             -- SendOptions.RetryExpiresAt or
-                                            -- ServiceConfig.DefaultMaxRetryAge at PublishToDLQ time
+                                            -- ServiceConfig.DefaultMaxRetryAge at PublishToDLQ time.
+                                            -- Nullable, not NOT NULL (revised during implementation):
+                                            -- NULL means "no deadline" — only reachable by
+                                            -- constructing a DLQMessage directly with a zero
+                                            -- ExpiresAt, bypassing Service (which always sets one) —
+                                            -- matching memoryDLQHandler's identical treatment.
     status VARCHAR(32) NOT NULL,           -- string enum, not a Postgres ENUM type; now includes
                                             -- 'expired' alongside pending/retrying/resolved/exhausted
     attempt_history JSONB NOT NULL DEFAULT '[]',
@@ -829,16 +834,19 @@ SET status = 'expired', updated_at = $2
 WHERE status = 'pending' AND expires_at <= $1;
 
 -- name: ClaimRetryableEvents :many
--- Step 2: the original claim, with an added "AND expires_at > $1" so a
--- row can never be claimed for retry past its own deadline — this
--- predicate is what actually enforces the cutoff; step 1 above only
--- exists so an event that nobody claims in time still surfaces as
--- 'expired' instead of sitting silently in 'pending' forever.
+-- Step 2: the original claim, with an added
+-- "AND (expires_at IS NULL OR expires_at > $1)" so a row can never be
+-- claimed for retry past its own deadline — this predicate is what
+-- actually enforces the cutoff; step 1 above only exists so an event
+-- that nobody claims in time still surfaces as 'expired' instead of
+-- sitting silently in 'pending' forever. NULL must be explicitly OR'd
+-- in since "NULL > $1" evaluates to NULL, not true, in SQL.
 UPDATE grpop_dlq
 SET status = 'retrying', updated_at = $2
 WHERE send_id IN (
-    SELECT send_id FROM grpop_dlq
-    WHERE status = 'pending' AND next_retry_at <= $1 AND expires_at > $1
+    SELECT send_id FROM grpop_dlq AS candidate
+    WHERE status = 'pending' AND next_retry_at <= $1
+        AND (expires_at IS NULL OR expires_at > $1)
     ORDER BY next_retry_at
     LIMIT $3
     FOR UPDATE SKIP LOCKED
