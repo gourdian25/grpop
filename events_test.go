@@ -85,6 +85,11 @@ func TestPublishMessageFailed_NilBusIsNoop(t *testing.T) {
 	PublishMessageFailed(context.Background(), nil, NopLogger(), MessageFailedPayload{SendID: "id-1", Channel: ChannelWhatsApp})
 }
 
+func TestPublishMessageFailed_PublishErrorIsLoggedNotPropagated(t *testing.T) {
+	bus := &fakeEventBus{publishErr: errors.New("bus unavailable")}
+	PublishMessageFailed(context.Background(), bus, NopLogger(), MessageFailedPayload{SendID: "id-1", Channel: ChannelWhatsApp})
+}
+
 func TestPublishMessageFailed_PublishesExpectedTopicAndReason(t *testing.T) {
 	bus := &fakeEventBus{}
 	PublishMessageFailed(context.Background(), bus, NopLogger(), MessageFailedPayload{

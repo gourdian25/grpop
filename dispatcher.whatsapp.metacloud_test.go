@@ -290,3 +290,15 @@ func TestMaskPhoneNumber(t *testing.T) {
 		t.Fatalf("maskPhoneNumber = %q, want ***", got)
 	}
 }
+
+func TestNewMetaCloudWhatsAppDispatcher_ConstructsRealClientFromPhoneNumberIDAndToken(t *testing.T) {
+	sender, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{
+		PhoneNumberID: "123456", AccessToken: "test-token",
+	})
+	if err != nil {
+		t.Fatalf("NewMetaCloudWhatsAppDispatcher: %v", err)
+	}
+	if err := sender.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}

@@ -225,3 +225,39 @@ func TestCircuitBreaker_ConcurrentExecute(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestCircuitBreaker_TooManyRequestsWhileHalfOpen(t *testing.T) {
+	cb, err := NewCircuitBreakerWithConfig(CircuitBreakerConfig{
+		MaxFailures: 1, Timeout: 10 * time.Millisecond, ResetTimeout: time.Hour, MaxHalfOpenRequests: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewCircuitBreakerWithConfig: %v", err)
+	}
+
+	// Trip the breaker open.
+	_ = cb.Execute(context.Background(), func() error { return errors.New("fail") })
+	if cb.State() != CircuitStateOpen {
+		t.Fatalf("State() = %v, want CircuitStateOpen", cb.State())
+	}
+	time.Sleep(15 * time.Millisecond) // let Timeout elapse
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_ = cb.Execute(context.Background(), func() error {
+			close(started)
+			<-release
+			return nil
+		})
+		close(done)
+	}()
+
+	<-started // the first half-open trial is now in flight, holding the single MaxHalfOpenRequests slot
+	if err := cb.Execute(context.Background(), func() error { return nil }); !errors.Is(err, ErrTooManyRequests) {
+		t.Fatalf("second concurrent Execute() while half-open err = %v, want ErrTooManyRequests", err)
+	}
+
+	close(release)
+	<-done
+}

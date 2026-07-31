@@ -126,3 +126,61 @@ func TestMetaCloudAPIClient_GetApprovedTemplates_RequiresBusinessAccountID(t *te
 		t.Fatal("GetApprovedTemplates() with empty BusinessAccountID err = nil, want non-nil")
 	}
 }
+
+func TestMetaCloudAPIClient_SendTemplateMessage_MalformedSuccessBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{not valid json`))
+	}))
+	defer server.Close()
+
+	client := newTestMetaCloudAPIClient(server.URL)
+	_, err := client.SendTemplateMessage(context.Background(), WhatsAppCloudAPIRequest{To: "1", TemplateName: "t", LanguageCode: "en_US"})
+	if err == nil {
+		t.Fatal("SendTemplateMessage() with malformed JSON body err = nil, want non-nil")
+	}
+}
+
+func TestMetaCloudAPIClient_SendTemplateMessage_NoMessageIDInResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"messaging_product":"whatsapp","messages":[]}`))
+	}))
+	defer server.Close()
+
+	client := newTestMetaCloudAPIClient(server.URL)
+	_, err := client.SendTemplateMessage(context.Background(), WhatsAppCloudAPIRequest{To: "1", TemplateName: "t", LanguageCode: "en_US"})
+	if err == nil {
+		t.Fatal("SendTemplateMessage() with an empty messages array err = nil, want non-nil")
+	}
+}
+
+func TestMetaCloudAPIClient_GetApprovedTemplates_MalformedBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{not valid json`))
+	}))
+	defer server.Close()
+
+	client := newTestMetaCloudAPIClient(server.URL)
+	if _, err := client.GetApprovedTemplates(context.Background()); err == nil {
+		t.Fatal("GetApprovedTemplates() with malformed JSON body err = nil, want non-nil")
+	}
+}
+
+func TestMetaCloudAPIClient_DoJSON_NonJSONErrorBody(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`<html>gateway error</html>`))
+	}))
+	defer server.Close()
+
+	client := newTestMetaCloudAPIClient(server.URL)
+	_, err := client.SendTemplateMessage(context.Background(), WhatsAppCloudAPIRequest{To: "1", TemplateName: "t", LanguageCode: "en_US"})
+	if err == nil {
+		t.Fatal("SendTemplateMessage() err = nil, want non-nil")
+	}
+	if !strings.Contains(err.Error(), "status 500") {
+		t.Fatalf("err = %v, want it to mention the raw status code since the body wasn't Meta's JSON error envelope", err)
+	}
+}

@@ -450,3 +450,82 @@ func TestMessageIDDomain(t *testing.T) {
 		t.Fatalf("messageIDDomain(not-an-email) = %q, want grpop.invalid", got)
 	}
 }
+
+func TestSMTPDispatcher_Send_InlineTemplateRequiresEngine(t *testing.T) {
+	sender, _ := newTestSMTPDispatcher(t, &fakeSMTPClient{}, nil)
+	_, err := sender.Send(context.Background(), EmailMessage{
+		To: "a@b.com", InlineTemplate: &EmailTemplate{SubjectTemplate: "s", HTMLBodyTemplate: "b"},
+	})
+	if !errors.Is(err, ErrEmailTemplateEngineRequired) {
+		t.Fatalf("Send() err = %v, want ErrEmailTemplateEngineRequired", err)
+	}
+}
+
+func TestSMTPDispatcher_Send_UsesInlineTemplate(t *testing.T) {
+	engine := NewEmailTemplateEngine(EmailTemplateEngineConfig{})
+	client := &fakeSMTPClient{}
+	sender, _ := newTestSMTPDispatcher(t, client, func(d *SMTPDispatcherDeps) { d.TemplateEngine = engine })
+
+	_, err := sender.Send(context.Background(), EmailMessage{
+		To:             "a@b.com",
+		InlineTemplate: &EmailTemplate{SubjectTemplate: "Hi {{.Name}}", HTMLBodyTemplate: "<p>Inline, {{.Name}}</p>"},
+		TemplateData:   map[string]any{"Name": "Grace"},
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !bytes.Contains(client.dataWritten, []byte("Inline, Grace")) {
+		t.Fatalf("rendered inline body missing from DATA payload: %s", client.dataWritten)
+	}
+}
+
+func TestSMTPDispatcher_Send_AuthIsCalledWhenConfigured(t *testing.T) {
+	client := &fakeSMTPClient{}
+	sender, _ := newTestSMTPDispatcher(t, client, func(d *SMTPDispatcherDeps) {
+		d.Auth = smtp.PlainAuth("", "user", "pass", "localhost")
+		d.AllowInsecureAuth = true
+	})
+	if _, err := sender.Send(context.Background(), EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if !client.authCalled {
+		t.Fatal("client.Auth was never called despite Deps.Auth being configured")
+	}
+}
+
+func TestSMTPDispatcher_Send_AuthError(t *testing.T) {
+	client := &fakeSMTPClient{authErr: errors.New("auth rejected")}
+	sender, _ := newTestSMTPDispatcher(t, client, func(d *SMTPDispatcherDeps) {
+		d.Auth = smtp.PlainAuth("", "user", "pass", "localhost")
+		d.AllowInsecureAuth = true
+	})
+	_, err := sender.Send(context.Background(), EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b"})
+	if err == nil {
+		t.Fatal("Send() err = nil, want non-nil (Auth failed)")
+	}
+}
+
+func TestSMTPDispatcher_Send_DataError(t *testing.T) {
+	client := &fakeSMTPClient{dataErr: errors.New("data command rejected")}
+	sender, _ := newTestSMTPDispatcher(t, client, nil)
+	_, err := sender.Send(context.Background(), EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b"})
+	if err == nil {
+		t.Fatal("Send() err = nil, want non-nil (Data failed)")
+	}
+}
+
+func TestSMTPDispatcher_Send_WriteError(t *testing.T) {
+	client := &fakeSMTPClient{writeErr: errors.New("connection reset mid-write")}
+	sender, _ := newTestSMTPDispatcher(t, client, nil)
+	_, err := sender.Send(context.Background(), EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b"})
+	if err == nil {
+		t.Fatal("Send() err = nil, want non-nil (write failed)")
+	}
+}
+
+func TestRealSMTPDialer_DialError(t *testing.T) {
+	dialer := &realSMTPDialer{serverName: "localhost", tlsMode: SMTPTLSInsecureNoTLS, connectTimeout: 200 * time.Millisecond}
+	if _, err := dialer.Dial("localhost:1"); err == nil {
+		t.Fatal("Dial(unreachable) err = nil, want non-nil")
+	}
+}

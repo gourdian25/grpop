@@ -167,6 +167,22 @@ func TestApplyPostgresSchema_AcquireFailsOnClosedPool(t *testing.T) {
 	}
 }
 
+func TestConnectPostgres_SharedPool_PingFails(t *testing.T) {
+	pool, err := pgxpool.New(context.Background(), testPostgresDSN)
+	if err != nil {
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	if err := pool.Ping(context.Background()); err != nil {
+		pool.Close()
+		t.Skipf("PostgreSQL not available, skipping: %v", err)
+	}
+	pool.Close() // Ping on an already-closed pool fails, exercising connectPostgres' cfg.Pool-supplied Ping-error branch.
+
+	if _, _, _, err := connectPostgres(context.Background(), PostgresConfig{Pool: pool}, "TestComponent"); err == nil {
+		t.Fatal("connectPostgres(closed externally-supplied Pool) = nil error, want non-nil")
+	}
+}
+
 func TestConnectPostgres_ConcurrentSchemaApplyDoesNotRace(t *testing.T) {
 	pool, err := pgxpool.New(context.Background(), testPostgresDSN)
 	if err != nil {

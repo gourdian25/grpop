@@ -59,6 +59,13 @@ func TestNewMongoDLQHandler_EmptyDatabase(t *testing.T) {
 	}
 }
 
+func TestNewMongoDLQHandler_MalformedURI(t *testing.T) {
+	_, err := NewMongoDLQHandler(MongoDLQHandlerConfig{URI: "not-a-valid-mongo-uri", Database: "grpop_test"})
+	if err == nil {
+		t.Fatal("NewMongoDLQHandler(malformed URI) = nil error, want non-nil")
+	}
+}
+
 func TestMongoDLQHandler_ClaimRetryableEvents_DefaultsLimit(t *testing.T) {
 	h := newTestMongoDLQHandler(t, 3, 0)
 	ctx := context.Background()

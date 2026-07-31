@@ -552,3 +552,37 @@ func TestDefaultServiceConfig(t *testing.T) {
 		t.Fatalf("MaxInlineRetries = %d, want >= 0", cfg.MaxInlineRetries)
 	}
 }
+
+func TestService_SendEmail_DLQPublishItselfFailingIsLoggedNotPropagated(t *testing.T) {
+	svc, idem, dlq, _, _, bus, metrics := newTestService(t, func(d *ServiceDeps) {
+		d.EmailSender = &fakeControllableEmailSender{failTimes: 999, transientErr: errors.New("boom")}
+		d.Config = ServiceConfig{MaxInlineRetries: 0}
+	})
+	dlq.publishErr = errors.New("dlq backend unavailable")
+
+	result, err := svc.SendEmail(context.Background(), validEmailMsg(), SendOptions{IdempotencyKey: "k1"})
+	if err != nil {
+		t.Fatalf("SendEmail() err = %v, want nil (a DLQ publish failure must not surface as a pipeline error)", err)
+	}
+	if result.Status != SendStatusFailed {
+		t.Fatalf("Status = %v, want SendStatusFailed", result.Status)
+	}
+	if len(dlq.calls()) != 1 {
+		t.Fatalf("dlq publish attempts = %d, want 1", len(dlq.calls()))
+	}
+	if metrics.dedupHits != 0 {
+		t.Fatalf("dedupHits = %d, want 0", metrics.dedupHits)
+	}
+	// The lifecycle "failed" event still fires — it reports the original
+	// send failure, independent of whether the DLQ write itself succeeded.
+	events := bus.events()
+	if len(events) != 1 || events[0].Topic != TopicMessageFailed {
+		t.Fatalf("events = %v, want exactly one TopicMessageFailed", events)
+	}
+	// The idempotency key is still marked processed even though the DLQ
+	// write failed — Service has done everything it's going to do for this
+	// key regardless.
+	if idem.markProcessedCalls != 1 {
+		t.Fatalf("markProcessedCalls = %d, want 1", idem.markProcessedCalls)
+	}
+}
