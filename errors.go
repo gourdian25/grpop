@@ -97,4 +97,14 @@ var (
 	// was never claimed via ClaimRetryableEvents, already resolved/
 	// exhausted/expired, or claimed by a concurrent caller.
 	ErrDLQEventNotClaimed = errors.New("grpop: dead-letter event is not in a claimed (retrying) state")
+
+	// ErrEmailFromRequired indicates both EmailMessage.From and the
+	// dispatcher's configured DefaultFrom were empty — SMTP requires a MAIL
+	// FROM address, and grpop does not invent one.
+	ErrEmailFromRequired = errors.New("grpop: email From address is required (set EmailMessage.From or SMTPDispatcherDeps.DefaultFrom)")
+
+	// ErrEmailTemplateEngineRequired indicates an EmailMessage used
+	// TemplateName or InlineTemplate but the dispatcher has no
+	// EmailTemplateEngine configured to render it.
+	ErrEmailTemplateEngineRequired = errors.New("grpop: email message uses TemplateName/InlineTemplate but no EmailTemplateEngine is configured")
 )
