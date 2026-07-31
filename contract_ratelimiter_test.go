@@ -4,6 +4,7 @@ package grpop
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -109,7 +110,19 @@ func TestRateLimiter_Contract(t *testing.T) {
 			return rl
 		})
 	})
-	// A "Redis" subtest is added alongside ratelimiter.redis.go (Stage 9) —
-	// intentionally not present yet, since that backend doesn't exist in
-	// this stage.
+	t.Run("Redis", func(t *testing.T) {
+		testRateLimiterContract(t, func(t *testing.T, requestsPerSecond, burstSize int) RateLimiter {
+			t.Helper()
+			rl, err := NewRedisRateLimiter(RedisRateLimiterConfig{
+				Addr: testRedisAddr, Password: testRedisPassword,
+				RequestsPerSecond: requestsPerSecond, BurstSize: burstSize,
+				KeyPrefix: fmt.Sprintf("test:contract-ratelimit:%s:%d", t.Name(), time.Now().UnixNano()),
+			})
+			if err != nil {
+				t.Skipf("Redis not available at %s, skipping: %v", testRedisAddr, err)
+			}
+			t.Cleanup(func() { _ = rl.(*redisRateLimiter).Close() })
+			return rl
+		})
+	})
 }
