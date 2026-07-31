@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -379,7 +380,7 @@ func (c *metaCloudAPIClient) GetApprovedTemplates(ctx context.Context) ([]WhatsA
 func countTemplateParameters(bodyText string) int {
 	max := 0
 	for i := 1; i <= 20; i++ {
-		if bytes.Contains([]byte(bodyText), []byte(fmt.Sprintf("{{%d}}", i))) {
+		if strings.Contains(bodyText, "{{"+strconv.Itoa(i)+"}}") {
 			max = i
 		}
 	}
