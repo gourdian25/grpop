@@ -2,15 +2,24 @@
 
 // Command example sends grpop's four grounding ERP use cases
 // (grpop-plan.md §2: auth.ForgotPassword, provider.IssueInvite,
-// admin.IssueInvite, a tenant's first-admin invite) as real emails over
-// SMTP, so the templates + SMTP dispatcher can be exercised end to end
-// before being wired into a real application. Service (idempotency/rate
-// limiting/DLQ orchestration) isn't built yet, so this calls EmailSender.Send
-// directly — a real app will eventually route these through
-// Service.SendEmail instead, once that stage lands.
+// admin.IssueInvite, a tenant's first-admin invite) through a real
+// grpop.Service — idempotency, inline retry, DLQ-on-failure, all wired up —
+// so the whole pipeline can be exercised end to end before being wired into
+// a real application.
 //
-// By default this targets a local Mailpit SMTP server (localhost:1025, no
-// TLS, no auth) — the same one Stage 10's integration tests use — so it
+// Backends used here are deliberately the zero-external-dependency ones:
+// grcache.NewMemoryCache (idempotency) and grpop.NewMemoryDLQHandler (DLQ)
+// — swap these for NewCacheIdempotencyStore(a real Redis/Mongo grcache.Cache)
+// and NewPostgresDLQHandler/NewMongoDLQHandler respectively once you're
+// ready to run this for real; nothing about the Service/EmailMessage/
+// SendOptions call sites below changes.
+//
+// WhatsApp is wired to NewDryRunWhatsAppSender (Service requires a
+// WhatsAppSender even if this example only exercises email) — swap for
+// NewMetaCloudWhatsAppDispatcher once real Meta credentials are available.
+//
+// Email, by default, targets a local Mailpit SMTP server (localhost:1025,
+// no TLS, no auth) — the same one Stage 10's integration tests use — so it
 // runs with nothing but `docker run -d -p 1025:1025 -p 8025:8025
 // axllent/mailpit` and no real credentials. Point it at a real relay via
 // environment variables when you're ready to integrate for real:
@@ -35,6 +44,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/gourdian25/grcache"
 	"github.com/gourdian25/grpop"
 )
 
@@ -44,17 +54,50 @@ func main() {
 		log.Fatalf("register templates: %v", err)
 	}
 
-	sender, err := grpop.NewSMTPDispatcher(smtpDispatcherDepsFromEnv(engine))
+	emailSender, err := grpop.NewSMTPDispatcher(smtpDispatcherDepsFromEnv(engine))
 	if err != nil {
 		log.Fatalf("construct SMTP dispatcher: %v", err)
 	}
-	defer func() { _ = sender.Close() }()
+
+	idemCache, err := grcache.NewMemoryCache()
+	if err != nil {
+		log.Fatalf("construct memory cache: %v", err)
+	}
+
+	// Every constructor above can fail, so all deferred cleanup is
+	// registered together only once construction has fully succeeded —
+	// avoids a defer being silently skipped by an earlier log.Fatalf exit.
+	defer func() { _ = emailSender.Close() }()
+	defer func() { _ = idemCache.Close() }()
+
+	// Service requires a WhatsAppSender too, even in an email-only demo —
+	// dry run never contacts Meta, so no credentials are needed to run this.
+	whatsAppSender := grpop.NewDryRunWhatsAppSender(nil)
+	idempotencyStore := grpop.NewCacheIdempotencyStore(idemCache)
+	dlqHandler := grpop.NewMemoryDLQHandler(5, time.Second, 30*time.Second, 20)
+	defer func() { _ = dlqHandler.Close() }()
+
+	svc, err := grpop.NewService(grpop.ServiceDeps{
+		IdempotencyStore: idempotencyStore,
+		DLQHandler:       dlqHandler,
+		EmailSender:      emailSender,
+		WhatsAppSender:   whatsAppSender,
+		Config:           grpop.DefaultServiceConfig(),
+	})
+	if err != nil {
+		//nolint:gocritic // NewService necessarily depends on the already-constructed,
+		// already-deferred resources above; a short-lived CLI exiting here loses nothing
+		// real (the OS reclaims everything on process exit)
+		log.Fatalf("construct service: %v", err)
+	}
+	defer func() { _ = svc.Close() }()
 
 	ctx := context.Background()
 	const appName = "Skipp"
 	const tenantName = "Acme Corp"
+	now := time.Now()
 
-	send(ctx, sender, "forgot password", grpop.EmailMessage{
+	send(ctx, svc, "forgot password", grpop.EmailMessage{
 		To:           "user@example.com",
 		TemplateName: EmailTemplateForgotPassword,
 		TemplateData: map[string]any{
@@ -63,9 +106,15 @@ func main() {
 			"ResetLink":        "https://app.skipp.co.in/reset-password?token=example-reset-token",
 			"ExpiresInMinutes": 30,
 		},
+	}, grpop.SendOptions{
+		IdempotencyKey: "demo-forgot-password",
+		// A real caller should set this to the reset token's own real
+		// expiry, not rely on ServiceConfig.DefaultMaxRetryAge (24h) —
+		// see plan §9 item 12.
+		RetryExpiresAt: now.Add(30 * time.Minute),
 	})
 
-	send(ctx, sender, "provider invite", grpop.EmailMessage{
+	send(ctx, svc, "provider invite", grpop.EmailMessage{
 		To:           "new-provider@example.com",
 		TemplateName: EmailTemplateInvite,
 		TemplateData: map[string]any{
@@ -75,9 +124,9 @@ func main() {
 			"InviteLink":     "https://app.skipp.co.in/invite/accept?token=example-provider-invite-token",
 			"ExpiresInHours": 72,
 		},
-	})
+	}, grpop.SendOptions{IdempotencyKey: "demo-provider-invite", RetryExpiresAt: now.Add(72 * time.Hour)})
 
-	send(ctx, sender, "admin invite", grpop.EmailMessage{
+	send(ctx, svc, "admin invite", grpop.EmailMessage{
 		To:           "new-admin@example.com",
 		TemplateName: EmailTemplateInvite,
 		TemplateData: map[string]any{
@@ -87,9 +136,9 @@ func main() {
 			"InviteLink":     "https://app.skipp.co.in/invite/accept?token=example-admin-invite-token",
 			"ExpiresInHours": 72,
 		},
-	})
+	}, grpop.SendOptions{IdempotencyKey: "demo-admin-invite", RetryExpiresAt: now.Add(72 * time.Hour)})
 
-	send(ctx, sender, "tenant first-admin invite", grpop.EmailMessage{
+	send(ctx, svc, "tenant first-admin invite", grpop.EmailMessage{
 		To:           "first-admin@example.com",
 		TemplateName: EmailTemplateInvite,
 		TemplateData: map[string]any{
@@ -99,13 +148,24 @@ func main() {
 			"InviteLink":     "https://app.skipp.co.in/invite/accept?token=example-first-admin-invite-token",
 			"ExpiresInHours": 72,
 		},
-	})
+	}, grpop.SendOptions{IdempotencyKey: "demo-first-admin-invite", RetryExpiresAt: now.Add(72 * time.Hour)})
+
+	// Calling the same key again demonstrates the idempotency short-circuit
+	// — no second email is actually sent.
+	result, err := svc.SendEmail(ctx, grpop.EmailMessage{
+		To: "user@example.com", TemplateName: EmailTemplateForgotPassword,
+		TemplateData: map[string]any{"AppName": appName, "ResetLink": "unused", "ExpiresInMinutes": 30},
+	}, grpop.SendOptions{IdempotencyKey: "demo-forgot-password", RetryExpiresAt: now.Add(30 * time.Minute)})
+	if err != nil {
+		log.Fatalf("[forgot password, repeated] send failed: %v", err)
+	}
+	fmt.Printf("[forgot password, repeated] -> duplicate=%v (no second email sent)\n", result.Duplicate)
 
 	fmt.Println("\nDone — check http://localhost:8025 (Mailpit's web UI) if using the default local target.")
 }
 
-func send(ctx context.Context, sender grpop.EmailSender, label string, msg grpop.EmailMessage) {
-	result, err := sender.Send(ctx, msg)
+func send(ctx context.Context, svc grpop.Service, label string, msg grpop.EmailMessage, opts grpop.SendOptions) {
+	result, err := svc.SendEmail(ctx, msg, opts)
 	if err != nil {
 		log.Fatalf("[%s] send failed: %v", label, err)
 	}

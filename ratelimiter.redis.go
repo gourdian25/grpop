@@ -237,10 +237,15 @@ func (s *redisRecipientStats) stats(requestsPerSec, burstSize int) RateLimiterSt
 // here: Allow/Wait return the backend error (wrapped in ErrBackendUnavailable)
 // unchanged, the same way every other backend interface in this module
 // (IdempotencyStore, DLQHandler) surfaces its own errors rather than
-// silently picking a default. Whether "Redis is down" should mean "block
-// every send" or "let everything through unlimited" is Service's call to
-// make explicitly (Stage 15), not something a rate-limiter backend should
-// decide unilaterally on its callers' behalf.
+// silently picking a default.
+//
+// RESOLVED at Stage 15: dispatcher.email.smtp.go/
+// dispatcher.whatsapp.metacloud.go both call RateLimiter.Wait and treat a
+// non-nil error as a failed Send (fail-closed) — Service itself never holds
+// a RateLimiter at all (see service.go's ServiceDeps doc comment for why
+// rate limiting stays dispatcher-layer-only, not duplicated at both
+// layers). So "Redis is down" does mean "block every send," decided at the
+// dispatcher construction site, not silently defaulted here.
 type redisRateLimiter struct {
 	client    *redis.Client
 	logger    Logger

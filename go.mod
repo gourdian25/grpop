@@ -4,6 +4,7 @@ go 1.26.4
 
 require (
 	github.com/gourdian25/grcache v0.3.1
+	github.com/gourdian25/grevents v0.2.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/redis/go-redis/v9 v9.21.0
 	go.mongodb.org/mongo-driver v1.17.9
