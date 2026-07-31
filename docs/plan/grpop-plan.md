@@ -171,6 +171,20 @@ const (
 // to reuse) or passed inline per-send (EmailMessage.InlineTemplate,
 // compiled fresh each call) — same fields, same rendering rules either
 // way (§4.8).
+//
+// SECURITY NOTE, InlineTemplate specifically (§9): the plausible real
+// source for an inline template is per-tenant custom branding — i.e.
+// content that may trace back to a tenant admin's own input, not a
+// trusted grpop operator. html/template auto-escapes DATA values safely,
+// but the template STRUCTURE itself is not sandboxed against referencing
+// TemplateData fields the caller didn't intend to expose (e.g. an
+// internal field accidentally present in the map) — InlineTemplate
+// content must come from a trusted admin-configured path, never raw
+// end-user input, and RenderInline enforces a size cap
+// (EmailTemplateEngineConfig.MaxInlineTemplateBytes, default 64KiB,
+// returns ErrInlineTemplateTooLarge) so an oversized/pathological
+// template can't cost unbounded parse/render CPU per call — a real cost
+// specifically because RenderInline, unlike Render, is never cached.
 type EmailTemplate struct {
 	SubjectTemplate  string // text/template
 	HTMLBodyTemplate string // html/template — see §4.8 for why HTML specifically differs from grnoti
@@ -247,6 +261,18 @@ type SendResult struct {
 	Status            SendStatus
 	SentAt            time.Time
 	Raw               map[string]string // optional vendor-specific diagnostic fields — logging only
+
+	// Duplicate is true if this call short-circuited on
+	// IdempotencyStore.IsProcessed (the same IdempotencyKey was already
+	// marked processed) rather than performing a new vendor call — new
+	// field this revision (§9): a dedup hit was previously silent (no
+	// error, no distinguishing signal), which hides a real class of
+	// caller bug (the same key reused for two genuinely different
+	// message bodies) as "why didn't the second invite email go out."
+	// Callers that care can now check this explicitly; Service also logs
+	// a Warn and increments Metrics.IncIdempotencyDedupHit on every hit
+	// regardless of whether the caller inspects this field.
+	Duplicate bool
 }
 
 // SendOptions carries per-send cross-cutting behavior.
@@ -422,7 +448,9 @@ type Service interface {
 
 `SendEmail`/`SendWhatsApp` return `ErrIdempotencyKeyRequired` immediately, before any rate-limit check or vendor call, if `opts.IdempotencyKey == ""`.
 
-When a send does fall through to the DLQ, `Service` computes the `DLQMessage.ExpiresAt` it publishes with (§4.6) as `opts.RetryExpiresAt` if the caller set one, otherwise `time.Now().Add(cfg.DefaultMaxRetryAge)` — a new `ServiceConfig.DefaultMaxRetryAge` field (proposed default: `24 * time.Hour`, flagged as a judgment call in §9 item 12) that only matters when a caller doesn't supply a more precise deadline of their own.
+When a send does fall through to the DLQ, `Service` computes the `DLQMessage.ExpiresAt` it publishes with (§4.6) as `opts.RetryExpiresAt` if the caller set one, otherwise `time.Now().Add(cfg.DefaultMaxRetryAge)` — a new `ServiceConfig.DefaultMaxRetryAge` field (proposed default: `24 * time.Hour`, flagged as a judgment call in §9 item 12) that only matters when a caller doesn't supply a more precise deadline of their own. If a caller-supplied `RetryExpiresAt` is already at or before `time.Now()` at the moment of publish (clock skew, or a bug in the caller's own token-TTL computation), `Service` still calls `PublishToDLQ` — the event is durably recorded, then immediately picked up as `DLQStatusExpired` on the next `ClaimRetryableEvents` sweep — but logs a `Warn` first, so this surfaces as "your token TTL is misconfigured," not an unexplained zero-retry DLQ entry someone has to reverse-engineer later (§9).
+
+**Idempotency dedup hits are logged, not silent (new, §9):** when `IdempotencyStore.IsProcessed` returns true for an incoming `IdempotencyKey`, `Service` returns immediately with `SendResult{Duplicate: true, ...}` (no vendor call, no rate-limit consumption) — but first logs a `Warn` (key + channel only, never message content, same discipline as `DryRunSender`'s redaction) and increments `Metrics.IncIdempotencyDedupHit(channel)`. A dedup hit is the expected, correct behavior for a genuine retried request (e.g. a browser resubmitting a forgot-password POST) — but it's indistinguishable, without this logging, from a real caller bug (the same key accidentally reused for two different message bodies, silently dropping the second one). Visibility here costs one log line and one counter increment per hit; the alternative is a support ticket asking "why didn't the second invite go out" with nothing in any log to explain it.
 
 **What a broker *could* be used for, if this changes:** the natural extension point is exactly the one `grnoti` already proved — an `EventConsumer`-shaped adapter (`Start(ctx, handler func(context.Context, Event) error) error`) that calls `Service.SendEmail`/`SendWhatsApp` as its handler, composing purely through matching function signatures with zero import coupling into `service.go` itself. Candidate brokers for that adapter, if/when it's built (none chosen or implemented in v1 — see §9 item 4):
 - **Kafka** — the most directly relevant option since `skipp.app.erp.golang.backend` already has a live Kafka connection today that nothing currently publishes to; `grnoti`'s own `consumer.kafka.go` (built on `github.com/IBM/sarama`) is the exact, already-proven pattern to copy if this is wired up later.
@@ -542,6 +570,27 @@ type DLQHandler interface {
 ```
 
 No background reclaim loop inside `grpop` itself — `ClaimRetryableEvents` is a primitive a consuming application's own periodic worker/cron calls. **This is the closest thing to a "queue" that exists in v1** — a durable, pull-based retry table in Postgres/Mongo, not a broker: nothing pushes a claimed event anywhere, a caller's own process polls for work.
+
+**`grpop_dlq` is a secrets store, not just a retry log — new, flagged explicitly (§9):** `DLQMessage` carries the full `EmailMessage`/`WhatsAppMessage`, including `TemplateData` — for `auth.ForgotPassword`, that's the raw reset link, sitting in `message_data` JSONB in the clear for up to `ExpiresAt` plus however long it takes a `PurgeExpiredEvents` sweep to actually delete it. This is the same class of exposure the `DryRunSender` logging fix (§4.11) addresses for logs, just for durable storage instead. Two mitigations, not mutually exclusive:
+
+```go
+// MessageEncryptor optionally encrypts DLQMessage's serialized bytes
+// before they're written to message_data, and decrypts on read back —
+// grpop provides only this seam, not a concrete implementation or any
+// key management (consistent with this ecosystem's stated scope: no
+// repo here does secret storage — see ECOSYSTEM_SCOPE.md). A consumer
+// wanting encryption at rest supplies their own (e.g. AES-GCM keyed from
+// whatever secrets manager already backs their gourdiantoken signing
+// keys).
+type MessageEncryptor interface {
+	Encrypt(plaintext []byte) ([]byte, error)
+	Decrypt(ciphertext []byte) ([]byte, error)
+}
+```
+
+`PostgresDLQHandlerConfig`/`MongoDLQHandlerConfig` gain an optional `Encryptor MessageEncryptor` field (nil is the default — plaintext, unchanged behavior). **If left nil** (the likely v1 default given no consuming team has asked for this yet), `grpop_dlq` must be operated with the same access-control rigor as a credentials table — network-isolated, RBAC'd, not queryable by anyone who wouldn't already be trusted with the reset links/invite tokens it can contain. This is stated in `docs.go` (§7) directly, not left to be discovered.
+
+**`AttemptHistory` is capped, not unbounded — new (§9):** each backend's `PublishToDLQ`/retry-recording path keeps at most `MaxAttemptHistoryEntries` (config field, default 20, on both Postgres/Mongo configs) entries per event, dropping the oldest (FIFO) once exceeded. Only matters for an event that keeps failing right up against `MaxRetries`/`ExpiresAt` — at expected volumes this is a non-issue, but leaving it uncapped would mean `attempt_history` JSONB grows without bound for a pathological repeatedly-failing event, so a cap is specified now rather than left to be noticed later.
 
 **Why a deadline independent of `MaxRetries` at all:** a retry-count ceiling alone assumes every failure is equally worth retrying no matter how much wall-clock time has passed — true for a generic delivery failure, but not for `grpop`'s actual payloads. A password-reset link or invite token is itself time-boxed (the token expires, independent of `grpop`); retrying a send for five more hours past that point doesn't help the recipient, it just spends vendor-call budget and rate-limit headroom delivering a message that's already useless. `ExpiresAt` lets the caller (or the library default) say "don't bother past this point," and `DLQStatusExpired` makes that outcome visible and distinguishable from `DLQStatusExhausted` (a real, possibly-alertable vendor-side problem) in dashboards/queries.
 
@@ -683,6 +732,14 @@ type Metrics interface {
 	IncDLQPublished(channel Channel)
 	IncCircuitBreakerStateChange(channel Channel, newState string)
 
+	// IncIdempotencyDedupHit records every SendResult.Duplicate == true
+	// outcome (§4.1, §9) — a real-time counter, alongside Service's own
+	// Warn-level log line, for a caller-bug class (an IdempotencyKey
+	// reused across two genuinely different message bodies) that would
+	// otherwise manifest only as "the second message silently never went
+	// out," with nothing in any log or metric to explain why.
+	IncIdempotencyDedupHit(channel Channel)
+
 	// ObserveSMTPResponseCode records the raw SMTP reply code (2xx/4xx/5xx)
 	// from every send attempt, even though grpop itself takes no action on
 	// the code beyond retry/DLQ classification. Added specifically as a
@@ -797,7 +854,7 @@ RETURNING *;
 - `Logger` interface + `NopLogger()`/`OrNop()`, verbatim `grnoti` shape.
 - Sentinel errors: `"grpop: message"` / `"grpop/<component>: ..."` sub-prefix; `errors.Is`-matched, no `IsX(err) bool` helpers.
 - `Close()` idempotent via `sync.Once` + `atomic.Bool`.
-- `docs.go`: godoc only, "Package shape" + "Precise, non-aspirational claims" sections (mirroring `grnoti/docs.go`) — now including a note that `SendStatusSent` means "SMTP relay/Meta API accepted it," never "arrived in an inbox/on a phone," that `TemplateValidator`'s cache means "approved as of the last check," not a live guarantee, that **there is no message broker anywhere in this package** — `Service.SendX` is a direct, synchronous vendor call (§4.4) — that `DLQStatusExpired` (§4.6) is a deadline-based cutoff wholly independent of `PurgeExpiredEvents`' unrelated "expired" (old-enough-to-delete) usage, despite the shared word, that **retries are at-least-once, not exactly-once** (§4.4 — the reason `IdempotencyKey` is required, not optional), and that **`grpop` never refreshes or rotates a Meta access token** — token lifecycle is entirely the operator's responsibility (§4.3, §9).
+- `docs.go`: godoc only, "Package shape" + "Precise, non-aspirational claims" sections (mirroring `grnoti/docs.go`) — now including a note that `SendStatusSent` means "SMTP relay/Meta API accepted it," never "arrived in an inbox/on a phone," that `TemplateValidator`'s cache means "approved as of the last check," not a live guarantee, that **there is no message broker anywhere in this package** — `Service.SendX` is a direct, synchronous vendor call (§4.4) — that `DLQStatusExpired` (§4.6) is a deadline-based cutoff wholly independent of `PurgeExpiredEvents`' unrelated "expired" (old-enough-to-delete) usage, despite the shared word, that **retries are at-least-once, not exactly-once** (§4.4 — the reason `IdempotencyKey` is required, not optional), that **`grpop` never refreshes or rotates a Meta access token** — token lifecycle is entirely the operator's responsibility (§4.3, §9), and that **`grpop_dlq` stores full send payloads (including secrets like reset links) in the clear unless a `MessageEncryptor` is configured** — operate it with credentials-table-grade access control by default (§4.6, §9).
 - Testing: real in-package `contract_*_test.go` files, real local Docker Postgres/Redis/Mongo/**Mailpit**, `t.Skip` when unreachable, `-race` mandatory. **Only** the Meta WhatsApp client is the documented fake-only exception now (§3, §4.3) — a first for a vendor-facing dispatcher in this ecosystem.
 - Shared dependency versions: `jackc/pgx/v5`, `go.mongodb.org/mongo-driver` (v1, not v2), `redis/go-redis/v9`, aligned to whatever `grcache`'s go.sum currently pins. **No vendor-messaging-SDK version to track at all**, and no message-broker client library version either — a direct consequence of the dependency-minimization goal.
 
@@ -865,6 +922,11 @@ Judgment calls, flagged rather than buried:
 18. **§4.10, new — adopted per review**: **`TemplateValidator.Validate` checks variable-count arity, not just approval status.** Confirming a template is *approved* but not that `TemplateVariables`' length matches its expected parameter count still lets an arity mismatch fail at the vendor — `WhatsAppTemplateInfo.ParameterCount` (a new field, populated from the same `GetApprovedTemplates` call already being cached) closes this gap at negligible extra cost.
 19. **§4.3, new**: **`grpop` never refreshes or rotates `MetaCloudDispatcherDeps.AccessToken`.** A long-lived/System User Meta token still has a real (if long) expiry; rotating it before that happens is entirely the operator's job — `grpop` just uses whatever token it's constructed with and returns whatever auth-failure error Meta gives back once it's stale. Stated explicitly so this isn't assumed to be handled somewhere it isn't.
 20. **§4.1/§4.8, new**: **Email supports a "custom template passed at send time" path (`EmailMessage.InlineTemplate` + `EmailTemplateEngine.RenderInline`) alongside the existing registered-by-name path**, for content not known ahead of `RegisterTemplate` time (e.g. per-tenant custom branding on an invite email). This is compiled fresh on every call, with no caching — a real cost if the identical inline template is sent at high volume, in which case registering it by name is the better fit. **WhatsApp has no equivalent inline path, and this is a hard vendor constraint, not an oversight**: `TemplateName` is already a free string (any Meta-approved template, however new, can be sent by name with zero grpop-side registration), but there is no way for `grpop` to render or invent WhatsApp template content itself — Meta's own approval process is the sole source of truth for what content may go out on that channel.
+21. **§4.6, new — flagged, not fully resolved**: **`grpop_dlq.message_data` is stored in the clear by default**, encryption-at-rest available only via an optional caller-supplied `MessageEncryptor` (a seam, not a shipped implementation — matching this ecosystem's stated "no repo here does secret storage" boundary). This is a real open question for the consuming team, not settled here: is network isolation + RBAC on the Postgres/Mongo instance itself sufficient, or does the actual sensitivity of what transits this table (live password-reset links, invite tokens) warrant application-level encryption from day one? Leaning toward "start with access control, add `MessageEncryptor` if/when a security review calls for it" — but this is exactly the kind of call worth the consuming team making explicitly rather than inheriting silently.
+22. **§4.1/§4.11, new**: **`EmailTemplate.InlineTemplate` content must originate from a trusted admin-configured path, never raw end-user input** — html/template protects against HTML injection *from data values*, not against the *template itself* being written to reference `TemplateData` fields the caller didn't intend to expose. `RenderInline` additionally enforces `MaxInlineTemplateBytes` (default 64KiB) purely as a CPU/resource bound (no caching applies to this path, unlike `Render`), not as a substitute for the trust-boundary requirement.
+23. **§4.1/§4.12, new — adopted per review**: **`SendResult` gains a `Duplicate bool` field, and a dedup hit is now logged (`Warn`) and counted (`Metrics.IncIdempotencyDedupHit`), not silent.** Making `IdempotencyKey` required (item 8) closes the double-send risk but opens a quieter one: a caller bug that accidentally reuses one key for two different message bodies now silently drops the second send with zero signal anywhere. This trades a small amount of log/metric noise on the (expected, common) genuine-retry case for visibility into the (rarer, worse) caller-bug case.
+24. **§4.4/§4.6, new**: **A `RetryExpiresAt` already in the past at `PublishToDLQ` time is accepted, not rejected** — the event is still durably recorded and immediately surfaces as `DLQStatusExpired` on the next sweep, but `Service` logs a `Warn` first. Rejecting outright (returning an error to the original `SendX` caller) was considered and not chosen: the send has already failed by this point, and the caller's HTTP request has already gotten (or is about to get) a `SendResult{Status: SendStatusFailed}` — erroring a second time on top of that for what's fundamentally a caller-side TTL-computation bug adds complexity without changing the outcome. The `Warn` log is judged sufficient for someone to notice the misconfiguration.
+25. **§4.6, new**: **`AttemptHistory` is capped at `MaxAttemptHistoryEntries` (default 20), oldest-dropped-first**, rather than unbounded. Only relevant for an event repeatedly failing right up to `MaxRetries`/`ExpiresAt` — at the volumes any of the four ERP use cases would plausibly produce this is not a real concern today, but specifying the cap now avoids `attempt_history` JSONB growing without bound for a pathological case later.
 
 ---
 
