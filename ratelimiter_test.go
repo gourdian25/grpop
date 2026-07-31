@@ -75,8 +75,8 @@ func TestLocalRateLimiter_GetStats_UnseenRecipientDoesNotCreateEntry(t *testing.
 		t.Fatalf("GetStats(unseen recipient) = %+v, want zero-value counts", stats)
 	}
 	impl := rl.(*localRateLimiter)
-	if impl.recipientOrder.Len() != 0 {
-		t.Fatalf("recipient cache grew to %d entries from a GetStats-only call, want 0", impl.recipientOrder.Len())
+	if impl.recipients.len() != 0 {
+		t.Fatalf("recipient cache grew to %d entries from a GetStats-only call, want 0", impl.recipients.len())
 	}
 }
 
@@ -137,13 +137,13 @@ func TestLocalRateLimiter_RecipientCacheEviction(t *testing.T) {
 	_, _ = rl.Allow(ctx, ChannelEmail, "r2@example.com")
 	_, _ = rl.Allow(ctx, ChannelEmail, "r3@example.com") // should evict r1 (least recently used)
 
-	if impl.recipientOrder.Len() != 2 {
-		t.Fatalf("recipient cache len = %d, want 2 (capacity)", impl.recipientOrder.Len())
+	if impl.recipients.len() != 2 {
+		t.Fatalf("recipient cache len = %d, want 2 (capacity)", impl.recipients.len())
 	}
-	if _, ok := impl.peekRecipientEntry(ChannelEmail, "r1@example.com"); ok {
+	if _, ok := impl.recipients.peek(recipientKey(ChannelEmail, "r1@example.com")); ok {
 		t.Fatal("r1 entry still present, want evicted (least recently used)")
 	}
-	if _, ok := impl.peekRecipientEntry(ChannelEmail, "r3@example.com"); !ok {
+	if _, ok := impl.recipients.peek(recipientKey(ChannelEmail, "r3@example.com")); !ok {
 		t.Fatal("r3 entry missing, want present (most recently used)")
 	}
 }
