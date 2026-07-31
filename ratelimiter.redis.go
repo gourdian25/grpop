@@ -4,12 +4,15 @@ package grpop
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	goredis "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9"
 )
 
 const (
@@ -26,10 +29,17 @@ const (
 	// token-bucket behavior anyway.
 	redisRateLimiterKeyTTL = 10 * time.Minute
 
-	// redisRateLimiterWaitPollInterval is how often Wait retries Allow
-	// while blocked. go-redis has no server-side blocking primitive for a
-	// Lua script the way a plain BLPOP would give one, so Wait polls.
+	// redisRateLimiterWaitPollInterval is the base interval Wait retries
+	// Allow at while blocked. go-redis has no server-side blocking
+	// primitive for a Lua script the way a plain BLPOP would give one, so
+	// Wait polls. redisRateLimiterWaitPollJitter is added on top,
+	// randomized fresh each iteration (see Wait), so that many goroutines
+	// or replicas simultaneously Wait-blocked on the same exhausted bucket
+	// don't all wake and hit Redis on the exact same tick cadence — a
+	// self-synchronized retry storm against Redis at precisely the moment
+	// the system is already rate-limited, i.e. already under pressure.
 	redisRateLimiterWaitPollInterval = 20 * time.Millisecond
+	redisRateLimiterWaitPollJitter   = 10 * time.Millisecond
 )
 
 // twoTierTokenBucketScript atomically evaluates and updates TWO token
@@ -44,17 +54,28 @@ const (
 // buckets' available tokens before consuming either, with no equivalent
 // "give back a token" step needed.
 //
+// "now" is read once server-side via redis.call("TIME"), NOT passed in as
+// a client-supplied argument — deliberately: this script is evaluated by
+// every replica of a multi-process deployment (the entire point of this
+// backend over localRateLimiter), and those replicas' wall clocks are not
+// guaranteed to agree. A replica with a fast clock computing its own
+// elapsed-time-since-last-refill would grant itself a larger refill than a
+// replica with an accurate clock, silently corrupting the shared bucket —
+// exactly the correctness property a distributed rate limiter exists to
+// provide. Reading Redis's own clock makes every caller agree on "now" by
+// construction, at the cost of one extra redis.call inside the script
+// (still one network round trip total — TIME runs server-side).
+//
 // KEYS[1] = channel-level bucket key
 // KEYS[2] = per-(channel,recipient)-level bucket key
 // ARGV[1] = capacity (burst size), shared by both tiers
 // ARGV[2] = refill rate, tokens/second, shared by both tiers
-// ARGV[3] = now, unix seconds as a float
-// ARGV[4] = key TTL, seconds
+// ARGV[3] = key TTL, seconds
 //
 // Returns 1 if a token was consumed from both buckets (allowed), 0
 // otherwise (neither bucket is touched beyond recording the refill that
 // would have happened anyway).
-var twoTierTokenBucketScript = goredis.NewScript(`
+var twoTierTokenBucketScript = redis.NewScript(`
 local function refill(key, capacity, refillRate, now)
     local bucket = redis.call("HMGET", key, "tokens", "updated_at")
     local tokens = tonumber(bucket[1])
@@ -73,8 +94,10 @@ end
 
 local capacity = tonumber(ARGV[1])
 local refillRate = tonumber(ARGV[2])
-local now = tonumber(ARGV[3])
-local ttl = tonumber(ARGV[4])
+local ttl = tonumber(ARGV[3])
+
+local t = redis.call("TIME")
+local now = tonumber(t[1]) + tonumber(t[2]) / 1e6
 
 local chTokens = refill(KEYS[1], capacity, refillRate, now)
 local recTokens = refill(KEYS[2], capacity, refillRate, now)
@@ -209,8 +232,17 @@ func (s *redisRecipientStats) stats(requestsPerSec, burstSize int) RateLimiterSt
 // its actual token buckets, reused here purely for local observability
 // bookkeeping since recipient identifiers are still caller-controlled,
 // unbounded-cardinality input.
+//
+// Fail-open vs. fail-closed on a Redis outage is deliberately NOT decided
+// here: Allow/Wait return the backend error (wrapped in ErrBackendUnavailable)
+// unchanged, the same way every other backend interface in this module
+// (IdempotencyStore, DLQHandler) surfaces its own errors rather than
+// silently picking a default. Whether "Redis is down" should mean "block
+// every send" or "let everything through unlimited" is Service's call to
+// make explicitly (Stage 15), not something a rate-limiter backend should
+// decide unilaterally on its callers' behalf.
 type redisRateLimiter struct {
-	client    *goredis.Client
+	client    *redis.Client
 	logger    Logger
 	keyPrefix string
 
@@ -251,7 +283,7 @@ func NewRedisRateLimiter(cfg RedisRateLimiterConfig) (RateLimiter, error) {
 	cfg = cfg.withDefaults()
 	logger := OrNop(cfg.Logger)
 
-	client := goredis.NewClient(&goredis.Options{
+	client := redis.NewClient(&redis.Options{
 		Addr:         cfg.Addr,
 		Password:     cfg.Password,
 		DB:           cfg.DB,
@@ -284,8 +316,17 @@ func (r *redisRateLimiter) channelKey(channel Channel) string {
 	return r.keyPrefix + ":channel:" + string(channel)
 }
 
+// recipientRedisKey hashes recipient (SHA-256, hex) into the key rather
+// than concatenating it raw. recipient is caller-controlled input
+// (EmailMessage.To/WhatsAppMessage.To — validated only for non-emptiness,
+// not character content) — hashing removes any possibility of two
+// genuinely different (channel, recipient) pairs colliding onto the same
+// Redis key regardless of what characters recipient contains, rather than
+// relying on "email addresses and phone numbers don't contain the ':'
+// delimiter in practice."
 func (r *redisRateLimiter) recipientRedisKey(channel Channel, recipient string) string {
-	return r.keyPrefix + ":recipient:" + string(channel) + ":" + recipient
+	sum := sha256.Sum256([]byte(recipient))
+	return r.keyPrefix + ":recipient:" + string(channel) + ":" + hex.EncodeToString(sum[:])
 }
 
 func (r *redisRateLimiter) Allow(ctx context.Context, channel Channel, recipient string) (bool, error) {
@@ -302,14 +343,18 @@ func (r *redisRateLimiter) Allow(ctx context.Context, channel Channel, recipient
 
 	stats := r.recipientStats.getOrCreate(recipientKey(channel, recipient), func() *redisRecipientStats { return &redisRecipientStats{} })
 
-	now := float64(time.Now().UnixNano()) / 1e9
 	keys := []string{r.channelKey(channel), r.recipientRedisKey(channel, recipient)}
-	res, err := twoTierTokenBucketScript.Run(ctx, r.client, keys, burst, rate, now, int(redisRateLimiterKeyTTL.Seconds())).Result()
+	res, err := twoTierTokenBucketScript.Run(ctx, r.client, keys, burst, rate, int(redisRateLimiterKeyTTL.Seconds())).Result()
 	if err != nil {
 		return false, fmt.Errorf("grpop: redis rate limiter eval: %w", ErrBackendUnavailable)
 	}
 
-	allowed := res.(int64) == 1
+	allowedN, ok := res.(int64)
+	if !ok {
+		return false, fmt.Errorf("grpop: redis rate limiter: unexpected script result type %T", res)
+	}
+
+	allowed := allowedN == 1
 	if allowed {
 		stats.recordAllowed()
 	} else {
@@ -318,11 +363,11 @@ func (r *redisRateLimiter) Allow(ctx context.Context, channel Channel, recipient
 	return allowed, nil
 }
 
-// Wait polls Allow at redisRateLimiterWaitPollInterval until a token is
-// available or ctx is done. Redis has no server-side blocking primitive
-// for a Lua-scripted token bucket the way BLPOP gives a plain list, so
-// unlike localRateLimiter's Wait (which defers to golang.org/x/time/rate's
-// own timer-based Wait), this one polls.
+// Wait polls Allow, at redisRateLimiterWaitPollInterval plus a fresh random
+// jitter each iteration, until a token is available or ctx is done. Redis
+// has no server-side blocking primitive for a Lua-scripted token bucket the
+// way BLPOP gives a plain list, so unlike localRateLimiter's Wait (which
+// defers to golang.org/x/time/rate's own timer-based Wait), this one polls.
 func (r *redisRateLimiter) Wait(ctx context.Context, channel Channel, recipient string) error {
 	if r.closed.Load() {
 		return ErrClosed
@@ -330,8 +375,6 @@ func (r *redisRateLimiter) Wait(ctx context.Context, channel Channel, recipient 
 	stats := r.recipientStats.getOrCreate(recipientKey(channel, recipient), func() *redisRecipientStats { return &redisRecipientStats{} })
 	stats.recordWait()
 
-	ticker := time.NewTicker(redisRateLimiterWaitPollInterval)
-	defer ticker.Stop()
 	for {
 		allowed, err := r.Allow(ctx, channel, recipient)
 		if err != nil {
@@ -340,10 +383,15 @@ func (r *redisRateLimiter) Wait(ctx context.Context, channel Channel, recipient 
 		if allowed {
 			return nil
 		}
+
+		//nolint:gosec // poll-interval jitter has no cryptographic requirement
+		jitter := time.Duration(rand.Int63n(int64(redisRateLimiterWaitPollJitter)))
+		timer := time.NewTimer(redisRateLimiterWaitPollInterval + jitter)
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return ctx.Err()
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
 }
