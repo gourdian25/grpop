@@ -1,4 +1,5 @@
 .
+├── CHANGELOG.md
 ├── LICENSE
 ├── Makefile
 ├── README.md
@@ -71,4 +72,4 @@
 ├── types.go
 └── version.go
 
-6 directories, 65 files
+6 directories, 66 files

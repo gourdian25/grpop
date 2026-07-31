@@ -1,1 +1,5 @@
-.barks/
+dist
+.barks
+coverage.out
+coverage.html
+example/example
