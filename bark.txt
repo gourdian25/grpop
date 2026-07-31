@@ -1,17 +1,38 @@
 .
 ├── LICENSE
 ├── Makefile
+├── README.md
 ├── cache.idempotency.go
 ├── cache.idempotency_test.go
 ├── circuitbreaker.go
 ├── circuitbreaker_test.go
+├── contract_dlqhandler_test.go
+├── contract_helpers_test.go
+├── contract_idempotencystore_test.go
+├── contract_ratelimiter_test.go
+├── dispatcher.email.smtp.go
+├── dispatcher.email.smtp_mailpit_test.go
+├── dispatcher.email.smtp_test.go
+├── dispatcher.whatsapp.metacloud.go
+├── dispatcher.whatsapp.metacloud_http_test.go
+├── dispatcher.whatsapp.metacloud_test.go
+├── dlq.mongo.go
+├── dlq.mongo_test.go
 ├── dlq.postgres.go
 ├── dlq.postgres_test.go
 ├── docs/
+│   ├── architecture.md
 │   └── plan/
 │       └── grpop-plan.md
 ├── docs.go
+├── dryrun.go
+├── dryrun_test.go
 ├── errors.go
+├── events.go
+├── events_test.go
+├── example/
+│   ├── main.go
+│   └── templates_auth.go
 ├── go.mod
 ├── go.sum
 ├── interfaces.go
@@ -26,6 +47,8 @@
 │       └── schema.sql
 ├── logger.go
 ├── logger_test.go
+├── lru.go
+├── lru_test.go
 ├── memory.go
 ├── memory_test.go
 ├── payloadvalidator.go
@@ -33,13 +56,19 @@
 ├── postgres.go
 ├── postgres_test.go
 ├── ratelimiter.go
+├── ratelimiter.redis.go
+├── ratelimiter.redis_test.go
 ├── ratelimiter_test.go
 ├── retrystrategy.go
 ├── retrystrategy_test.go
+├── service.go
+├── service_test.go
 ├── sqlc.yaml
 ├── templateengine.email.go
 ├── templateengine.email_test.go
+├── templatevalidator.whatsapp.go
+├── templatevalidator.whatsapp_test.go
 ├── types.go
 └── version.go
 
-5 directories, 37 files
+6 directories, 65 files
