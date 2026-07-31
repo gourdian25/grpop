@@ -395,6 +395,17 @@ type SMTPDispatcherDeps struct {
 	SendTimeout    time.Duration
 
 	Dialer         SMTPDialer     // optional; nil uses a real net/smtp-backed dialer
+
+	// TemplateEngine renders EmailMessage.TemplateName/InlineTemplate into a
+	// literal Subject/HTMLBody/TextBody before the MIME message is built.
+	// ADDED DURING IMPLEMENTATION (Stage 10, not in the original draft's
+	// field list above): content-mode resolution has to happen somewhere
+	// before the vendor call, and no earlier stage owns an
+	// EmailTemplateEngine instance — Service (§4.4) never held one either.
+	// Required only if a Send call actually uses TemplateName/
+	// InlineTemplate; a literal EmailMessage never touches it.
+	TemplateEngine EmailTemplateEngine
+
 	RateLimiter    RateLimiter    // optional
 	CircuitBreaker CircuitBreaker // optional
 	Metrics        Metrics        // optional, §4.12
@@ -406,6 +417,15 @@ type SMTPDispatcherDeps struct {
 // out; defined here now.
 type MetaCloudDispatcherDeps struct {
 	PhoneNumberID string // Meta's phone-number-id path segment for the messages endpoint
+
+	// BusinessAccountID is Meta's WhatsApp Business Account (WABA) ID — a
+	// distinct ID from PhoneNumberID. ADDED DURING IMPLEMENTATION (Stage 11,
+	// not in the original draft's field list above): message templates
+	// belong to the WABA, not the phone number, so GetApprovedTemplates
+	// (§4.3) has no other way to know which account to list templates for.
+	// Required only if a TemplateValidator backed by this client is
+	// actually used (Stage 12/§4.10); Send never needs it.
+	BusinessAccountID string
 
 	// AccessToken is a long-lived/System User access token. grpop does
 	// NOT refresh or rotate this token — token lifecycle (rotation before
@@ -890,11 +910,11 @@ RETURNING *;
 
 **Stage 9 — Redis: distributed `RateLimiter`.** `ratelimiter.redis.go`'s two-tier Lua-scripted bucket.
 
-**Stage 10 — Email dispatcher.** `dispatcher.email.smtp.go`, stdlib `net/smtp`-based. Tested against a real local **Mailpit/MailHog** Docker container — this ecosystem's first vendor-facing dispatcher tested against a real local double rather than a fake.
+**Stage 10 — Email dispatcher. DONE.** `dispatcher.email.smtp.go`, stdlib `net/smtp`-based; `SMTPDialer`/`SMTPClient` narrow interfaces (satisfied directly by `*smtp.Client`, no adapter needed), `SMTPTLSMode` construction-time guard (§9 item 14), goroutine-raced `ConnectTimeout`/`SendTimeout` enforcement (net/smtp's blocking API has no cancellation, so a timed-out call is abandoned, not interrupted — documented as a known limitation, not a bug), hand-rolled `multipart/alternative` MIME builder. Tested against a real local **Mailpit** Docker container (`dispatcher.email.smtp_mailpit_test.go`) for both literal and `TemplateEngine`-rendered sends, plus a fake-dialer unit suite (`dispatcher.email.smtp_test.go`) covering validation, rate-limiter/circuit-breaker wiring, and the timeout path — this ecosystem's first vendor-facing dispatcher tested against a real local double rather than a fake.
 
-**Stage 11 — WhatsApp dispatcher.** `dispatcher.whatsapp.metacloud.go`, `grpop`'s own hand-rolled Graph API HTTP client, tested against a fake `WhatsAppCloudAPIClient` (the one remaining deliberate real-services exception).
+**Stage 11 — WhatsApp dispatcher. DONE.** `dispatcher.whatsapp.metacloud.go`, `grpop`'s own hand-rolled Graph API HTTP client (`metaCloudAPIClient`, `net/http` + `encoding/json` only), tested against a fake `WhatsAppCloudAPIClient` (the one remaining deliberate real-services exception) plus a separate `httptest.Server`-backed suite exercising the real HTTP client's request-building/auth-header/error-envelope-parsing logic without touching Meta itself.
 
-**Stage 12 — `templatevalidator.whatsapp.go`.** The Meta-backed `TemplateValidator` (§4.10), optionally wired into Stage 11's dispatcher.
+**Stage 12 — `templatevalidator.whatsapp.go`. DONE.** The Meta-backed `TemplateValidator` (§4.10) — `metaTemplateValidator`, a TTL-cached (default 5m) map over `GetApprovedTemplates`, refreshed lazily on a stale `Validate` call or eagerly via `Refresh`. Tested against the same fake `WhatsAppCloudAPIClient` as Stage 11, including TTL-expiry and per-language-approval-scoping cases. Optionally wired into Stage 11's dispatcher via `MetaCloudDispatcherDeps.TemplateValidator`.
 
 **Stage 13 — `dryrun.go`.** `NewDryRunEmailSender`/`NewDryRunWhatsAppSender` (§4.11).
 
