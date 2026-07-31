@@ -54,6 +54,10 @@ var (
 	// pick exactly one.
 	ErrMultipleContentModesSet = errors.New("grpop: email message has more than one content mode set (TemplateName, InlineTemplate, literal body are mutually exclusive)")
 
+	// ErrEmailTemplateNotFound indicates EmailTemplateEngine.Render was
+	// called with a name no RegisterTemplate call has registered.
+	ErrEmailTemplateNotFound = errors.New("grpop: email template not found")
+
 	// ErrInlineTemplateTooLarge indicates an EmailMessage.InlineTemplate's
 	// combined template source exceeds
 	// EmailTemplateEngineConfig.MaxInlineTemplateBytes. RenderInline has no
