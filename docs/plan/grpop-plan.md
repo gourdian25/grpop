@@ -166,20 +166,39 @@ const (
 	ChannelWhatsApp Channel = "whatsapp"
 )
 
-// EmailMessage is a freeform-body email. Either set TemplateName (and
-// TemplateData) to render Subject/HTMLBody/TextBody via a registered
-// EmailTemplateEngine template, or set Subject/HTMLBody/TextBody directly —
-// not both; a message with TemplateName set ignores any literal
-// Subject/HTMLBody/TextBody fields (see ErrTemplateAndLiteralBodyBothSet).
+// EmailTemplate is the raw template content, usable two ways: registered
+// once by name (EmailTemplateEngine.RegisterTemplate, compiled once, cheap
+// to reuse) or passed inline per-send (EmailMessage.InlineTemplate,
+// compiled fresh each call) — same fields, same rendering rules either
+// way (§4.8).
+type EmailTemplate struct {
+	SubjectTemplate  string // text/template
+	HTMLBodyTemplate string // html/template — see §4.8 for why HTML specifically differs from grnoti
+	TextBodyTemplate string // text/template, optional
+}
+
+// EmailMessage is an email with exactly one of three mutually-exclusive
+// content modes set (see ErrMultipleContentModesSet, a new sentinel this
+// revision adds for exactly this validation):
+//  1. TemplateName (+ TemplateData) — renders via a template already
+//     registered with EmailTemplateEngine.RegisterTemplate.
+//  2. InlineTemplate (+ TemplateData) — a caller-supplied custom template,
+//     rendered on the fly via EmailTemplateEngine.RenderInline without
+//     requiring prior registration. This is the "pass a custom template
+//     at send time" path — for content not known ahead of RegisterTemplate
+//     time, e.g. per-tenant custom branding on an invite email.
+//  3. Literal Subject/HTMLBody/TextBody — no templating at all, used
+//     verbatim.
 type EmailMessage struct {
-	To           []string // one or more recipient addresses; required, len >= 1
-	From         string   // optional; empty uses the dispatcher's configured default sender
-	ReplyTo      string   // optional
-	Subject      string
-	HTMLBody     string
-	TextBody     string // optional plain-text alternative part
-	TemplateName string
-	TemplateData map[string]any
+	To             string // single recipient address, required — see §9 for why this isn't []string
+	From           string // optional; empty uses the dispatcher's configured default sender
+	ReplyTo        string // optional
+	Subject        string
+	HTMLBody       string
+	TextBody       string // optional plain-text alternative part
+	TemplateName   string
+	InlineTemplate *EmailTemplate // new — see the type's doc comment and mode 2 above
+	TemplateData   map[string]any
 }
 
 // WhatsAppMessage is structurally different from EmailMessage on purpose:
@@ -187,9 +206,24 @@ type EmailMessage struct {
 // outside a user-initiated 24-hour session window, which every one of
 // grpop's ERP use cases falls into (all system-initiated, none a reply to
 // a live user session). There is deliberately no freeform Body field.
+//
+// "Custom template" for WhatsApp means something different from email's
+// InlineTemplate (§4.1) — TemplateName is a free string, not restricted to
+// a fixed/hardcoded set, so ANY template a caller has had approved by Meta
+// (however new, however tenant/feature-specific) can be sent by name with
+// no grpop-side registration step at all. What's NOT possible, as a hard
+// vendor constraint rather than a grpop design gap: there is no ad-hoc/
+// unregistered-with-Meta WhatsApp template — grpop cannot render or invent
+// WhatsApp template content itself the way EmailTemplateEngine.RenderInline
+// can for email, because Meta's own approval process is the source of
+// truth for what content is allowed to go out. Getting a new template
+// approved is a Meta-side action a caller takes outside grpop entirely;
+// TemplateValidator (§4.10) only checks against whatever is already
+// approved, it doesn't submit new ones.
 type WhatsAppMessage struct {
 	To                string            // E.164 phone number, required
-	TemplateName      string            // required — the Meta-approved template's name
+	TemplateName      string            // required — the Meta-approved template's name; any
+	                                    // approved name works, nothing hardcoded/enumerated grpop-side
 	TemplateVariables map[string]string // stringified positional keys ("1","2","3", in order),
 	                                    // per Meta Cloud API's template-parameter convention
 	LanguageCode      string            // e.g. "en_US", required, must match the approved
@@ -217,7 +251,15 @@ type SendResult struct {
 
 // SendOptions carries per-send cross-cutting behavior.
 type SendOptions struct {
-	IdempotencyKey string        // caller-supplied; empty disables the idempotency check — see §9
+	// IdempotencyKey is REQUIRED — Service.SendEmail/SendWhatsApp return
+	// ErrIdempotencyKeyRequired if it's empty. Changed from optional in
+	// this revision (see §9): grpop's inline retry-on-transient-failure is
+	// at-least-once, not exactly-once (docs.go) — a network error after
+	// the vendor already accepted the message is indistinguishable from
+	// one before, so a retry can double-send. Every one of the four ERP
+	// use cases already has a natural key (a hash of the reset/invite
+	// token); there is no real caller today with no natural key to supply.
+	IdempotencyKey string
 	IdempotencyTTL time.Duration // 0 uses ServiceConfig's configured default
 	SkipRateLimit  bool          // escape hatch, e.g. an admin-triggered manual resend
 
@@ -284,17 +326,77 @@ type WhatsAppCloudAPIClient interface {
 Vendor-specific error classification stays internal to each dispatcher's own file, never leaking into `interfaces.go`. Cross-cutting concerns are injected via a `Deps` struct per dispatcher:
 
 ```go
+// SMTPTLSMode controls how dispatcher.email.smtp.go secures its connection
+// to Addr. Mandatory-by-default, not implicit — see §9: this replaces
+// vendor SDKs (SES/SendGrid) that handled transport security internally,
+// so grpop now owns getting this right.
+type SMTPTLSMode string
+
+const (
+	SMTPTLSStartTLS       SMTPTLSMode = "starttls"        // default; upgrades a plaintext
+	                                                      // connection via STARTTLS before AUTH/MAIL
+	SMTPTLSImplicit       SMTPTLSMode = "implicit"        // TLS from the first byte (e.g. port 465)
+	SMTPTLSInsecureNoTLS  SMTPTLSMode = "insecure_no_tls" // deliberately loud name — plaintext,
+	                                                      // intended only for a local Mailpit/MailHog
+	                                                      // test container (§3, §7), never production
+)
+
 type SMTPDispatcherDeps struct {
-	Addr           string   // e.g. "email-smtp.us-east-1.amazonaws.com:587" — SES/SendGrid/Postmark/
-	                        // Mailgun/a bare relay are all just different values here, never a
-	                        // different Go dependency
-	Auth           smtp.Auth
-	DefaultFrom    string
+	Addr        string // e.g. "email-smtp.us-east-1.amazonaws.com:587" — SES/SendGrid/Postmark/
+	                   // Mailgun/a bare relay are all just different values here, never a
+	                   // different Go dependency
+	Auth        smtp.Auth
+	DefaultFrom string
+
+	// TLSMode defaults to SMTPTLSStartTLS if unset (zero value maps to the
+	// secure default, not to SMTPTLSInsecureNoTLS). Constructing with
+	// Auth set and TLSMode == SMTPTLSInsecureNoTLS is a construction-time
+	// error (credentials over plaintext) unless AllowInsecureAuth is also
+	// explicitly set — see §9.
+	TLSMode           SMTPTLSMode
+	AllowInsecureAuth bool // explicit escape hatch for #TLSMode's construction-time guard; not
+	                       // expected to be set outside of a deliberately-isolated internal relay
+
+	// ConnectTimeout/SendTimeout bound one Send call end-to-end so a
+	// hanging vendor connection can't stall the caller's own request
+	// indefinitely (§4.4: every Send is synchronous on the caller's
+	// goroutine). Both apply as a ceiling in addition to, never instead
+	// of, ctx's own deadline if the caller supplied one — Send uses
+	// whichever deadline is sooner. Defaults: ConnectTimeout 5s,
+	// SendTimeout 15s (covers the full MAIL/RCPT/DATA sequence, not just
+	// the initial dial).
+	ConnectTimeout time.Duration
+	SendTimeout    time.Duration
+
 	Dialer         SMTPDialer     // optional; nil uses a real net/smtp-backed dialer
 	RateLimiter    RateLimiter    // optional
 	CircuitBreaker CircuitBreaker // optional
-	Metrics        Metrics        // optional
+	Metrics        Metrics        // optional, §4.12
 	Logger         Logger         // optional, OrNop'd at construction
+}
+
+// MetaCloudDispatcherDeps configures dispatcher.whatsapp.metacloud.go —
+// this struct was previously only referenced (§10) without being spelled
+// out; defined here now.
+type MetaCloudDispatcherDeps struct {
+	PhoneNumberID string // Meta's phone-number-id path segment for the messages endpoint
+
+	// AccessToken is a long-lived/System User access token. grpop does
+	// NOT refresh or rotate this token — token lifecycle (rotation before
+	// expiry) is entirely the operator's responsibility. See §9.
+	AccessToken string
+
+	// RequestTimeout bounds one Graph API HTTP call, same reasoning as
+	// SMTPDispatcherDeps.SendTimeout above — applies in addition to ctx's
+	// own deadline, whichever is sooner. Default: 10s.
+	RequestTimeout time.Duration
+
+	Client            WhatsAppCloudAPIClient // optional; nil constructs a real net/http-backed one
+	TemplateValidator TemplateValidator      // optional, §4.10
+	RateLimiter       RateLimiter            // optional
+	CircuitBreaker    CircuitBreaker         // optional
+	Metrics           Metrics                // optional, §4.12
+	Logger            Logger                 // optional, OrNop'd at construction
 }
 ```
 
@@ -315,6 +417,10 @@ type Service interface {
 ```
 
 **Is there a message broker in between, or does `grpop` send directly? Direct, in v1 — no broker.** `SendEmail`/`SendWhatsApp` call the vendor (SMTP relay / Meta Graph API) synchronously on the caller's own goroutine, with an inline Full-Jitter retry (`retrystrategy.go`) for transient per-call failures, and only fall through to `DLQHandler.PublishToDLQ` once those inline retries are exhausted. There is no producer/consumer split, no queue a message sits in between "caller asked for a send" and "vendor call happened." This matches all four ERP use cases (§2) exactly: each is a synchronous HTTP request/response flow where the handler wants (or at least logs) the outcome of the send in the same request, not "enqueue and move on."
+
+**Delivery guarantee, precisely (new, matching grnoti's own "precise, non-aspirational claims" discipline):** grpop's inline retry is **at-least-once, not exactly-once**. A network error after the vendor has already accepted the message but before its response reaches `grpop` is indistinguishable, from `grpop`'s side, from an error before acceptance — the inline retry (and any later DLQ-driven retry) cannot tell these apart and will attempt the send again either way. This is exactly why `SendOptions.IdempotencyKey` is required, not optional (§4.1, §9): the guarantee against a caller-visible double-send comes entirely from the caller supplying a stable key and `IdempotencyStore` catching the redelivery, not from any property of the send path itself.
+
+`SendEmail`/`SendWhatsApp` return `ErrIdempotencyKeyRequired` immediately, before any rate-limit check or vendor call, if `opts.IdempotencyKey == ""`.
 
 When a send does fall through to the DLQ, `Service` computes the `DLQMessage.ExpiresAt` it publishes with (§4.6) as `opts.RetryExpiresAt` if the caller set one, otherwise `time.Now().Add(cfg.DefaultMaxRetryAge)` — a new `ServiceConfig.DefaultMaxRetryAge` field (proposed default: `24 * time.Hour`, flagged as a judgment call in §9 item 12) that only matters when a caller doesn't supply a more precise deadline of their own.
 
@@ -457,15 +563,27 @@ Two backends, unchanged reasoning: local (per-process, bounded-LRU per-recipient
 // EmailTemplateEngine renders EmailMessage.Subject/HTMLBody/TextBody. Uses
 // html/template (NOT text/template) for HTMLBody specifically, because
 // HTMLBody renders into a real HTML document in the recipient's mail
-// client. Subject and TextBody use text/template. Compiled once at
-// RegisterTemplate time, not re-parsed per render.
+// client. Subject and TextBody use text/template.
 type EmailTemplateEngine interface {
+	// RegisterTemplate compiles tmpl once, under name, for repeated cheap
+	// reuse via Render — the path for templates known ahead of time.
 	RegisterTemplate(name string, tmpl EmailTemplate) error
 	Render(name string, data map[string]any) (subject, htmlBody, textBody string, err error)
+
+	// RenderInline compiles and renders tmpl on the fly, with no prior
+	// RegisterTemplate call — the "pass a custom template at send time"
+	// path (EmailMessage.InlineTemplate, §4.1), for content not known
+	// ahead of RegisterTemplate time (e.g. per-tenant custom branding).
+	// Same html/template-for-HTMLBody, text/template-for-Subject/TextBody
+	// rendering rules as Render. Not cached against any name — a caller
+	// sending the identical inline template repeatedly at high volume
+	// should register it via RegisterTemplate instead for the
+	// compile-once benefit; RenderInline compiles fresh every call.
+	RenderInline(tmpl EmailTemplate, data map[string]any) (subject, htmlBody, textBody string, err error)
 }
 ```
 
-**WhatsApp still has no `TemplateEngine` involvement at all** — `WhatsAppMessage.TemplateVariables` are substituted by Meta against its own pre-approved template content, not rendered by `grpop`.
+**WhatsApp still has no `TemplateEngine` involvement at all** — `WhatsAppMessage.TemplateVariables` are substituted by Meta against its own pre-approved template content, not rendered by `grpop`. See `WhatsAppMessage`'s own doc comment (§4.1) for why "pass a custom WhatsApp template" means "reference any Meta-approved template by name," not an email-style ad-hoc rendering path — that path structurally doesn't exist for WhatsApp.
 
 ### 4.9 Logger, Close, errors — unchanged, verbatim ecosystem shape
 
@@ -487,12 +605,31 @@ func OrNop(l Logger) Logger { if l == nil { return NopLogger() }; return l }
 Meta requires every WhatsApp template to go through an approval process before it can be used in a live send; a send against a not-yet-approved (or rejected, or since-deleted) template fails at the vendor. This interface lets a caller (or the dispatcher itself, if wired in) check first, turning a live-send failure into a cheap, cached pre-check:
 
 ```go
+// WhatsAppTemplateInfo describes one Meta-approved template, as returned
+// by WhatsAppCloudAPIClient.GetApprovedTemplates (§4.3).
+type WhatsAppTemplateInfo struct {
+	Name           string
+	LanguageCode   string
+	ParameterCount int // number of positional variables ("1","2","3", ...) the approved
+	                   // template body actually expects — added this revision (§9) so
+	                   // Validate can catch an arity mismatch, not just approval status
+}
+
 // TemplateValidator confirms a WhatsApp template name+language is currently
-// approved on Meta's side, before a live send is attempted against it.
-// Backed by Meta's own template-listing endpoint, with a short internal TTL
-// cache (templates change rarely, so this is not re-fetched on every call).
+// approved on Meta's side AND that the supplied variables' count matches
+// the approved template's expected parameter count — catching the two
+// most common vendor-rejection causes before a live send is attempted,
+// not just approval status alone (Validate replaces an earlier
+// IsApproved-only design per review — approval-without-arity-checking
+// still fails at the vendor on a mismatched variable count). Backed by
+// Meta's own template-listing endpoint, with a short internal TTL cache
+// (templates change rarely, so this is not re-fetched on every call).
 type TemplateValidator interface {
-	IsApproved(ctx context.Context, templateName, languageCode string) (bool, error)
+	// Validate returns nil if templateName+languageCode is approved and
+	// len(variables) matches its ParameterCount; ErrWhatsAppTemplateNotApproved
+	// if not approved; ErrWhatsAppTemplateArityMismatch (new sentinel) if
+	// approved but the variable count doesn't match.
+	Validate(ctx context.Context, templateName, languageCode string, variables map[string]string) error
 	// Refresh forces an immediate re-fetch of the approved-template list,
 	// bypassing the internal cache — e.g. call this right after registering
 	// a new template with Meta, instead of waiting out the TTL.
@@ -500,26 +637,66 @@ type TemplateValidator interface {
 }
 ```
 
-`NewMetaTemplateValidator(deps MetaTemplateValidatorDeps) TemplateValidator` implements this over `WhatsAppCloudAPIClient.GetApprovedTemplates` (§4.3). **Design decision, flagged explicitly in §9**: this is wired into `dispatcher.whatsapp.metacloud.go` as an *optional* `Deps.TemplateValidator` field — if set, `Send` consults it (cheap, cache-backed) and returns `ErrWhatsAppTemplateNotApproved` early instead of making a doomed vendor call; if unset, `Send` behaves exactly as before, relying on Meta's own rejection. It is advisory, not mandatory, and not a scheduled background job inside `grpop` — the cache is only ever refreshed by a `Send`-time check or an explicit `Refresh` call.
+`NewMetaTemplateValidator(deps MetaTemplateValidatorDeps) TemplateValidator` implements this over `WhatsAppCloudAPIClient.GetApprovedTemplates` (§4.3). **Design decision, flagged explicitly in §9**: this is wired into `dispatcher.whatsapp.metacloud.go` as an *optional* `Deps.TemplateValidator` field (§4.3) — if set, `Send` consults it (cheap, cache-backed) and returns the specific error early instead of making a doomed vendor call; if unset, `Send` behaves exactly as before, relying on Meta's own rejection. It is advisory, not mandatory, and not a scheduled background job inside `grpop` — the cache is only ever refreshed by a `Send`-time check or an explicit `Refresh` call.
 
 ### 4.11 `DryRunSender` — new: logging-only senders for staging
 
 ```go
 // NewDryRunEmailSender returns an EmailSender that never contacts a real
-// vendor: it logs the fully-resolved message (post-template-render) at
-// Info level and returns a synthetic SendResult{Status: SendStatusSent,
-// ProviderMessageID: "dryrun-<generated-id>"}. Distinct from memory.go's
-// in-memory test fake — that one exists for contract/unit tests and
-// records sends for assertions; this one exists for a staging/pre-prod
-// deployment that should never actually deliver mail/WhatsApp messages
-// but should otherwise exercise the exact same Service pipeline
-// (idempotency, rate limiting; DLQ-on-failure never triggers since dry-run
-// never fails).
+// vendor: it logs recipient + channel + template name (or "literal-body"/
+// "inline-template" if no TemplateName was set) at Info level, and returns
+// a synthetic SendResult{Status: SendStatusSent, ProviderMessageID:
+// "dryrun-<generated-id>"}. It deliberately does NOT log the rendered
+// Subject/HTMLBody/TextBody or TemplateData — staging environments still
+// write to shared log aggregation, and grpop's actual payloads are
+// security-sensitive (password-reset links, invite tokens); logging a
+// fully-rendered dry-run message would leak exactly the secret grpop
+// exists to deliver, into every staging log for however long retention
+// lasts. See §9 — this was flagged as a real vulnerability in review, not
+// a style preference. Distinct from memory.go's in-memory test fake —
+// that one exists for contract/unit tests and DOES record full sends for
+// assertions (test-only, not shipped to a shared log sink); this one
+// exists for a staging/pre-prod deployment that should never actually
+// deliver mail/WhatsApp messages but should otherwise exercise the exact
+// same Service pipeline (idempotency, rate limiting; DLQ-on-failure never
+// triggers since dry-run never fails).
 func NewDryRunEmailSender(logger Logger) EmailSender
 func NewDryRunWhatsAppSender(logger Logger) WhatsAppSender
 ```
 
 A construction-time swap (pick `NewDryRunEmailSender` instead of `NewSMTPDispatcher` when building `ServiceDeps` in a staging environment), not a runtime toggle inside the real dispatchers — kept deliberately simple, per §9.
+
+### 4.12 `Metrics` — new: concretely specified, not left implicit
+
+Every earlier section referenced an optional `Metrics Metrics` `Deps` field without ever defining the interface — nailed down now rather than left to be retrofitted later:
+
+```go
+// Metrics is the optional observability surface every dispatcher/Service
+// component accepts. All methods are fire-and-forget from the caller's
+// perspective — a nil Metrics is a silent no-op (OrNop-equivalent, §4.9's
+// pattern), and a real implementation should never block or error out the
+// operation it's instrumenting.
+type Metrics interface {
+	ObserveSendLatency(channel Channel, duration time.Duration)
+	IncSendResult(channel Channel, status SendStatus)
+	IncRateLimitRejected(channel Channel)
+	IncDLQPublished(channel Channel)
+	IncCircuitBreakerStateChange(channel Channel, newState string)
+
+	// ObserveSMTPResponseCode records the raw SMTP reply code (2xx/4xx/5xx)
+	// from every send attempt, even though grpop itself takes no action on
+	// the code beyond retry/DLQ classification. Added specifically as a
+	// deliverability-reputation canary (§9): a rising rate of 5xx (or a
+	// creeping 4xx rate) on an otherwise-succeeding send path is an early
+	// signal of sender-reputation damage on the configured relay — visible
+	// here well before it would show up as a drop in actual delivered
+	// mail, which grpop has no way to observe at all (§1.2's stated
+	// capability cut: no vendor-side bounce/complaint feedback).
+	ObserveSMTPResponseCode(code int)
+}
+```
+
+No default/no-op implementation ships as part of the public interface contract beyond "nil is safe" (matching `Logger`'s `OrNop` pattern) — a concrete Prometheus/OpenTelemetry-backed `Metrics` is left to the consuming application, same as every other optional collaborator in this design.
 
 ---
 
@@ -620,7 +797,7 @@ RETURNING *;
 - `Logger` interface + `NopLogger()`/`OrNop()`, verbatim `grnoti` shape.
 - Sentinel errors: `"grpop: message"` / `"grpop/<component>: ..."` sub-prefix; `errors.Is`-matched, no `IsX(err) bool` helpers.
 - `Close()` idempotent via `sync.Once` + `atomic.Bool`.
-- `docs.go`: godoc only, "Package shape" + "Precise, non-aspirational claims" sections (mirroring `grnoti/docs.go`) — now including a note that `SendStatusSent` means "SMTP relay/Meta API accepted it," never "arrived in an inbox/on a phone," that `TemplateValidator`'s cache means "approved as of the last check," not a live guarantee, that **there is no message broker anywhere in this package** — `Service.SendX` is a direct, synchronous vendor call (§4.4) — and that `DLQStatusExpired` (§4.6) is a deadline-based cutoff wholly independent of `PurgeExpiredEvents`' unrelated "expired" (old-enough-to-delete) usage, despite the shared word.
+- `docs.go`: godoc only, "Package shape" + "Precise, non-aspirational claims" sections (mirroring `grnoti/docs.go`) — now including a note that `SendStatusSent` means "SMTP relay/Meta API accepted it," never "arrived in an inbox/on a phone," that `TemplateValidator`'s cache means "approved as of the last check," not a live guarantee, that **there is no message broker anywhere in this package** — `Service.SendX` is a direct, synchronous vendor call (§4.4) — that `DLQStatusExpired` (§4.6) is a deadline-based cutoff wholly independent of `PurgeExpiredEvents`' unrelated "expired" (old-enough-to-delete) usage, despite the shared word, that **retries are at-least-once, not exactly-once** (§4.4 — the reason `IdempotencyKey` is required, not optional), and that **`grpop` never refreshes or rotates a Meta access token** — token lifecycle is entirely the operator's responsibility (§4.3, §9).
 - Testing: real in-package `contract_*_test.go` files, real local Docker Postgres/Redis/Mongo/**Mailpit**, `t.Skip` when unreachable, `-race` mandatory. **Only** the Meta WhatsApp client is the documented fake-only exception now (§3, §4.3) — a first for a vendor-facing dispatcher in this ecosystem.
 - Shared dependency versions: `jackc/pgx/v5`, `go.mongodb.org/mongo-driver` (v1, not v2), `redis/go-redis/v9`, aligned to whatever `grcache`'s go.sum currently pins. **No vendor-messaging-SDK version to track at all**, and no message-broker client library version either — a direct consequence of the dependency-minimization goal.
 
@@ -675,12 +852,19 @@ Judgment calls, flagged rather than buried:
 5. **§4.1**: Email attachments remain cut from v1 — **reconsidered and re-confirmed as a cut, not silently carried over.** The original draft's reasoning (vendor-API attachment-shape differences between SES/SendGrid) no longer applies now that email is SMTP-only, and a MIME `multipart/mixed` attachment part is genuinely low-effort to add on top of the multipart builder Stage 10 already needs to write. Still cut for v1 because none of the four ERP use cases need one — flagged here specifically so it isn't forgotten as "easy to add whenever it's actually needed," rather than assumed out of reach.
 6. **§5**: No durable send-log/delivery-status table beyond the DLQ (unchanged) — a full audit trail of every send is arguably `graudit`'s job, not `grpop`'s.
 7. **§4.2**: Two separate `EmailSender`/`WhatsAppSender` interfaces, not one unified `Sender` (unchanged reasoning, now over two channels instead of three).
-8. **§4.5/§4.6**: `SendOptions.IdempotencyKey` stays optional, not required; an empty key silently disables the idempotency check and, if the send later needs the DLQ, a random UUID becomes its `sendID` (unchanged from the original draft).
+8. **§4.1/§4.4, changed this revision**: `SendOptions.IdempotencyKey` is now **required**, reversing the original draft's "optional, empty silently disables the check" design. Raised in review: grpop's retries are at-least-once, not exactly-once (§4.4) — a network error after the vendor already accepted a send is indistinguishable from one before, so a retry can double-send a password-reset/invite email. The original "optional" framing was explicitly flagged as "the wrong footgun for a production library" given every one of the four ERP use cases already has a natural key. `Service.SendX` now returns `ErrIdempotencyKeyRequired` immediately if `opts.IdempotencyKey == ""`, before any rate-limit check or vendor call. `DLQEvent.SendID` is consequently always the caller's real key — an earlier draft's "generate a random UUID when no key was supplied" fallback no longer applies and has been removed as dead design now that a key is guaranteed to exist.
 9. **§4.10, new**: `TemplateValidator` is advisory and cache-backed, not a scheduled background refresh job inside `grpop` — a stale cache (Meta approves/rejects a template between `grpop`'s last check and a live send) means the pre-check can be wrong in either direction for up to the cache's TTL. This is accepted because the vendor call itself is still the ultimate source of truth (`Send` doesn't skip actually calling Meta just because the pre-check passed) — the validator only ever short-circuits an *already-known-bad* combination, it can't create a false negative that blocks a send that would have succeeded.
 10. **§4.11, new**: `DryRunSender` is a construction-time swap (choose it instead of the real dispatcher when building `ServiceDeps`), not a runtime flag on the real dispatchers — kept this way deliberately to avoid a `if dryRun { ... }` branch living inside otherwise-production dispatch code.
 11. **§1.2**: Twilio/Gupshup for WhatsApp, and any vendor-API email path (SES/SendGrid), are **explicitly deferred, not designed away** — both remain additive alt implementations behind the existing vendor-agnostic interfaces whenever a concrete need (BSP relationship, deliverability analytics) makes the added dependency worth it.
 12. **§4.6, new**: **`ServiceConfig.DefaultMaxRetryAge` defaults to `24 * time.Hour`** as the fallback retry deadline when a caller leaves `SendOptions.RetryExpiresAt` zero. This is a genuine guess, not derived from any of the four ERP use cases' actual token TTLs (which this plan doesn't know precisely — a password-reset token's real lifetime and an invite token's real lifetime are plausibly quite different from each other and from 24h). Flagged strongly: **callers should set `RetryExpiresAt` explicitly to match their own message's real expiry** rather than relying on the default — this is the same class of footgun as item 8's `IdempotencyKey`, and worth equal prominence in the README's quickstart (§10), not just the godoc. Revisit the default itself once the consuming team confirms real TTL values for both token types.
 13. **§4.6, new**: **`DLQStatusExpired` is checked before `DLQStatusExhausted` in `MarkRetried`.** A message whose deadline passes with retry budget still unused is reported as `Expired`, not `Exhausted` — these are different failure modes worth distinguishing in monitoring (`Exhausted` suggests a vendor-side problem worth alerting on; `Expired` suggests the message simply outlived its own usefulness, which is expected/benign behavior, not an incident). Stated as a judgment call because the two could have been collapsed into one terminal "gave up" status instead — kept separate specifically so a dashboard/alert can treat them differently without parsing `attempt_history`.
+14. **§4.3, new — must-fix per review, adopted**: **`SMTPDispatcherDeps.TLSMode` defaults to `SMTPTLSStartTLS` (mandatory), not plaintext.** `EmailSender` previously delegated transport security to whichever vendor SDK was in use (SES/SendGrid both handle TLS internally); now that `grpop` owns the raw connection, it must get this right itself rather than leaving it implicit. `SMTPTLSInsecureNoTLS` exists only for the local Mailpit/MailHog test container (§3), given a deliberately loud name to discourage accidental production use, and construction fails outright if `Auth` is set alongside it unless `AllowInsecureAuth` is also explicitly set (credentials over plaintext should require two deliberate opt-ins, not one).
+15. **§4.3, new — must-fix per review, adopted**: **`SMTPDispatcherDeps`/`MetaCloudDispatcherDeps` both get explicit `ConnectTimeout`/`SendTimeout`/`RequestTimeout` fields**, defaulting to 5s/15s/10s respectively (proposed, not derived from any real measurement — worth revisiting once real vendor latency is observed in practice). Every `Send` is synchronous on the caller's own HTTP goroutine (§4.4) with no queue to absorb a hang, so a vendor connection with no bound could stall a caller's request indefinitely and, at volume, exhaust a handler goroutine/connection pool. These act as a ceiling in addition to — never instead of — the caller's own `ctx` deadline.
+16. **§4.1, new — adopted per review**: **`EmailMessage.To` is a single `string`, not `[]string`.** A real SMTP transaction can accept some `RCPT TO` recipients and reject others in the same transaction, which `SendResult`'s singular `Status`/`ProviderMessageID` shape has no way to represent — rather than redesigning `SendResult` to carry per-recipient outcomes for a capability none of the four ERP use cases need (every one is single-recipient already), multi-recipient sends are cut entirely. A caller needing to notify several people (e.g. both a tenant admin and a platform admin) calls `SendEmail` once per recipient, each with its own `IdempotencyKey` — which is also the semantically correct behavior anyway (one recipient's failure and retry shouldn't be entangled with another's).
+17. **§4.12, new**: **`Metrics` is now concretely specified** (latency, send-result counts, rate-limit rejections, DLQ publishes, circuit-breaker transitions, and raw SMTP response codes) rather than left as a forward reference with no defined shape — cheap to nail down now, per review, versus retrofitting call sites later. `ObserveSMTPResponseCode` specifically exists as a deliverability-reputation canary: `grpop` has no vendor-side bounce/complaint feedback at all (§1.2), so a rising 4xx/5xx rate on the SMTP response code itself is the earliest signal available that something (e.g. a bad-address pattern from `IssueInvite`) is degrading sender reputation on the configured relay.
+18. **§4.10, new — adopted per review**: **`TemplateValidator.Validate` checks variable-count arity, not just approval status.** Confirming a template is *approved* but not that `TemplateVariables`' length matches its expected parameter count still lets an arity mismatch fail at the vendor — `WhatsAppTemplateInfo.ParameterCount` (a new field, populated from the same `GetApprovedTemplates` call already being cached) closes this gap at negligible extra cost.
+19. **§4.3, new**: **`grpop` never refreshes or rotates `MetaCloudDispatcherDeps.AccessToken`.** A long-lived/System User Meta token still has a real (if long) expiry; rotating it before that happens is entirely the operator's job — `grpop` just uses whatever token it's constructed with and returns whatever auth-failure error Meta gives back once it's stale. Stated explicitly so this isn't assumed to be handled somewhere it isn't.
+20. **§4.1/§4.8, new**: **Email supports a "custom template passed at send time" path (`EmailMessage.InlineTemplate` + `EmailTemplateEngine.RenderInline`) alongside the existing registered-by-name path**, for content not known ahead of `RegisterTemplate` time (e.g. per-tenant custom branding on an invite email). This is compiled fresh on every call, with no caching — a real cost if the identical inline template is sent at high volume, in which case registering it by name is the better fit. **WhatsApp has no equivalent inline path, and this is a hard vendor constraint, not an oversight**: `TemplateName` is already a free string (any Meta-approved template, however new, can be sent by name with zero grpop-side registration), but there is no way for `grpop` to render or invent WhatsApp template content itself — Meta's own approval process is the sole source of truth for what content may go out on that channel.
 
 ---
 
@@ -704,20 +888,27 @@ rateLimiter, err := grpop.NewRedisRateLimiter(grpop.RedisRateLimiterConfig{
 
 // Vendor is a config value, not a Go dependency — swap Addr/Auth for
 // SES/SendGrid/Postmark/Mailgun/a bare relay without changing any import.
+// TLSMode defaults to SMTPTLSStartTLS (mandatory) if left zero — §9 item 14.
 emailSender, err := grpop.NewSMTPDispatcher(grpop.SMTPDispatcherDeps{
-	Addr:        "email-smtp.us-east-1.amazonaws.com:587",
-	Auth:        smtp.PlainAuth("", sesSMTPUser, sesSMTPPass, "email-smtp.us-east-1.amazonaws.com"),
-	DefaultFrom: "no-reply@skipp.app",
-	RateLimiter: rateLimiter,
-	Logger:      logger,
+	Addr:           "email-smtp.us-east-1.amazonaws.com:587",
+	Auth:           smtp.PlainAuth("", sesSMTPUser, sesSMTPPass, "email-smtp.us-east-1.amazonaws.com"),
+	DefaultFrom:    "no-reply@skipp.app",
+	ConnectTimeout: 5 * time.Second,  // defaults shown explicitly; §9 item 15
+	SendTimeout:    15 * time.Second,
+	RateLimiter:    rateLimiter,
+	Metrics:        metrics, // §4.12
+	Logger:         logger,
 })
 
 templateValidator := grpop.NewMetaTemplateValidator(grpop.MetaTemplateValidatorDeps{ /* ... */ })
 whatsappSender, err := grpop.NewMetaCloudWhatsAppDispatcher(grpop.MetaCloudDispatcherDeps{
+	PhoneNumberID:     phoneNumberID,
+	AccessToken:       metaAccessToken, // grpop does not rotate this — §9 item 19
+	RequestTimeout:    10 * time.Second,
 	TemplateValidator: templateValidator, // optional, §4.10
 	RateLimiter:       rateLimiter,
+	Metrics:           metrics,
 	Logger:            logger,
-	/* ... */
 })
 
 // In a staging environment, swap either sender for its dry-run equivalent
@@ -738,15 +929,30 @@ A call site (e.g. wherever `auth.ForgotPassword` currently returns the raw token
 
 ```go
 result, err := svc.SendEmail(ctx, grpop.EmailMessage{
-	To:           []string{recipientEmail},
+	To:           recipientEmail, // single address — §9 item 16
 	TemplateName: "password-reset",
 	TemplateData: map[string]any{"ResetLink": link},
 }, grpop.SendOptions{
-	IdempotencyKey: hashOf(token),
+	IdempotencyKey: hashOf(token), // required — §9 item 8; omitting this is a compile-time-visible
+	                              // struct field miss, but a runtime ErrIdempotencyKeyRequired if
+	                              // left empty
 	RetryExpiresAt: tokenExpiresAt, // the same expiry already computed for the reset token itself
 	                                // (§9 item 12) — don't rely on ServiceConfig's 24h default here,
 	                                // it won't generally match the real token TTL
 })
+```
+
+A per-tenant custom-branded invite, using the inline-template path (§4.1, §9 item 20) instead of a pre-registered one:
+
+```go
+result, err := svc.SendEmail(ctx, grpop.EmailMessage{
+	To: recipientEmail,
+	InlineTemplate: &grpop.EmailTemplate{
+		SubjectTemplate:  tenant.CustomSubjectTemplate,  // not known at RegisterTemplate time
+		HTMLBodyTemplate: tenant.CustomHTMLBodyTemplate,
+	},
+	TemplateData: map[string]any{"InviteLink": link, "TenantName": tenant.Name},
+}, grpop.SendOptions{IdempotencyKey: hashOf(inviteToken), RetryExpiresAt: inviteExpiresAt})
 ```
 
 `result.Status`/`result.ProviderMessageID` is the delivery-status handle the call site logs or surfaces; a failed send after inline retries is durably recorded in `grpop_dlq` (with that `RetryExpiresAt` as its `ExpiresAt`, §4.6) for a separately-run reclaim worker to retry later — the call site itself never blocks on that retry, but it also never handed the send off to any broker to begin with (§4.4), and the reclaim worker itself will stop retrying once `tokenExpiresAt` passes rather than continuing to deliver a link that's already dead.
