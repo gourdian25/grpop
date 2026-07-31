@@ -395,6 +395,17 @@ type SMTPDispatcherDeps struct {
 	SendTimeout    time.Duration
 
 	Dialer         SMTPDialer     // optional; nil uses a real net/smtp-backed dialer
+
+	// TemplateEngine renders EmailMessage.TemplateName/InlineTemplate into a
+	// literal Subject/HTMLBody/TextBody before the MIME message is built.
+	// ADDED DURING IMPLEMENTATION (Stage 10, not in the original draft's
+	// field list above): content-mode resolution has to happen somewhere
+	// before the vendor call, and no earlier stage owns an
+	// EmailTemplateEngine instance — Service (§4.4) never held one either.
+	// Required only if a Send call actually uses TemplateName/
+	// InlineTemplate; a literal EmailMessage never touches it.
+	TemplateEngine EmailTemplateEngine
+
 	RateLimiter    RateLimiter    // optional
 	CircuitBreaker CircuitBreaker // optional
 	Metrics        Metrics        // optional, §4.12
@@ -406,6 +417,15 @@ type SMTPDispatcherDeps struct {
 // out; defined here now.
 type MetaCloudDispatcherDeps struct {
 	PhoneNumberID string // Meta's phone-number-id path segment for the messages endpoint
+
+	// BusinessAccountID is Meta's WhatsApp Business Account (WABA) ID — a
+	// distinct ID from PhoneNumberID. ADDED DURING IMPLEMENTATION (Stage 11,
+	// not in the original draft's field list above): message templates
+	// belong to the WABA, not the phone number, so GetApprovedTemplates
+	// (§4.3) has no other way to know which account to list templates for.
+	// Required only if a TemplateValidator backed by this client is
+	// actually used (Stage 12/§4.10); Send never needs it.
+	BusinessAccountID string
 
 	// AccessToken is a long-lived/System User access token. grpop does
 	// NOT refresh or rotate this token — token lifecycle (rotation before
@@ -789,10 +809,15 @@ CREATE TABLE IF NOT EXISTS grpop_dlq (
     first_failure_at TIMESTAMPTZ NOT NULL,
     last_attempt_at TIMESTAMPTZ NOT NULL,
     next_retry_at TIMESTAMPTZ NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,        -- NEW (§4.6): hard retry cutoff, independent of
+    expires_at TIMESTAMPTZ,                 -- NEW (§4.6): hard retry cutoff, independent of
                                             -- retry_count/max_retries — set from
                                             -- SendOptions.RetryExpiresAt or
-                                            -- ServiceConfig.DefaultMaxRetryAge at PublishToDLQ time
+                                            -- ServiceConfig.DefaultMaxRetryAge at PublishToDLQ time.
+                                            -- Nullable, not NOT NULL (revised during implementation):
+                                            -- NULL means "no deadline" — only reachable by
+                                            -- constructing a DLQMessage directly with a zero
+                                            -- ExpiresAt, bypassing Service (which always sets one) —
+                                            -- matching memoryDLQHandler's identical treatment.
     status VARCHAR(32) NOT NULL,           -- string enum, not a Postgres ENUM type; now includes
                                             -- 'expired' alongside pending/retrying/resolved/exhausted
     attempt_history JSONB NOT NULL DEFAULT '[]',
@@ -829,16 +854,19 @@ SET status = 'expired', updated_at = $2
 WHERE status = 'pending' AND expires_at <= $1;
 
 -- name: ClaimRetryableEvents :many
--- Step 2: the original claim, with an added "AND expires_at > $1" so a
--- row can never be claimed for retry past its own deadline — this
--- predicate is what actually enforces the cutoff; step 1 above only
--- exists so an event that nobody claims in time still surfaces as
--- 'expired' instead of sitting silently in 'pending' forever.
+-- Step 2: the original claim, with an added
+-- "AND (expires_at IS NULL OR expires_at > $1)" so a row can never be
+-- claimed for retry past its own deadline — this predicate is what
+-- actually enforces the cutoff; step 1 above only exists so an event
+-- that nobody claims in time still surfaces as 'expired' instead of
+-- sitting silently in 'pending' forever. NULL must be explicitly OR'd
+-- in since "NULL > $1" evaluates to NULL, not true, in SQL.
 UPDATE grpop_dlq
 SET status = 'retrying', updated_at = $2
 WHERE send_id IN (
-    SELECT send_id FROM grpop_dlq
-    WHERE status = 'pending' AND next_retry_at <= $1 AND expires_at > $1
+    SELECT send_id FROM grpop_dlq AS candidate
+    WHERE status = 'pending' AND next_retry_at <= $1
+        AND (expires_at IS NULL OR expires_at > $1)
     ORDER BY next_retry_at
     LIMIT $3
     FOR UPDATE SKIP LOCKED
@@ -882,17 +910,24 @@ RETURNING *;
 
 **Stage 9 — Redis: distributed `RateLimiter`.** `ratelimiter.redis.go`'s two-tier Lua-scripted bucket.
 
-**Stage 10 — Email dispatcher.** `dispatcher.email.smtp.go`, stdlib `net/smtp`-based. Tested against a real local **Mailpit/MailHog** Docker container — this ecosystem's first vendor-facing dispatcher tested against a real local double rather than a fake.
+**Stage 10 — Email dispatcher. DONE.** `dispatcher.email.smtp.go`, stdlib `net/smtp`-based; `SMTPDialer`/`SMTPClient` narrow interfaces (satisfied directly by `*smtp.Client`, no adapter needed), `SMTPTLSMode` construction-time guard (§9 item 14), goroutine-raced `ConnectTimeout`/`SendTimeout` enforcement (net/smtp's blocking API has no cancellation, so a timed-out call is abandoned, not interrupted — documented as a known limitation, not a bug), hand-rolled `multipart/alternative` MIME builder. Tested against a real local **Mailpit** Docker container (`dispatcher.email.smtp_mailpit_test.go`) for both literal and `TemplateEngine`-rendered sends, plus a fake-dialer unit suite (`dispatcher.email.smtp_test.go`) covering validation, rate-limiter/circuit-breaker wiring, and the timeout path — this ecosystem's first vendor-facing dispatcher tested against a real local double rather than a fake.
 
-**Stage 11 — WhatsApp dispatcher.** `dispatcher.whatsapp.metacloud.go`, `grpop`'s own hand-rolled Graph API HTTP client, tested against a fake `WhatsAppCloudAPIClient` (the one remaining deliberate real-services exception).
+**Stage 11 — WhatsApp dispatcher. DONE.** `dispatcher.whatsapp.metacloud.go`, `grpop`'s own hand-rolled Graph API HTTP client (`metaCloudAPIClient`, `net/http` + `encoding/json` only), tested against a fake `WhatsAppCloudAPIClient` (the one remaining deliberate real-services exception) plus a separate `httptest.Server`-backed suite exercising the real HTTP client's request-building/auth-header/error-envelope-parsing logic without touching Meta itself.
 
-**Stage 12 — `templatevalidator.whatsapp.go`.** The Meta-backed `TemplateValidator` (§4.10), optionally wired into Stage 11's dispatcher.
+**Stage 12 — `templatevalidator.whatsapp.go`. DONE.** The Meta-backed `TemplateValidator` (§4.10) — `metaTemplateValidator`, a TTL-cached (default 5m) map over `GetApprovedTemplates`, refreshed lazily on a stale `Validate` call or eagerly via `Refresh`. Tested against the same fake `WhatsAppCloudAPIClient` as Stage 11, including TTL-expiry and per-language-approval-scoping cases. Optionally wired into Stage 11's dispatcher via `MetaCloudDispatcherDeps.TemplateValidator`.
 
-**Stage 13 — `dryrun.go`.** `NewDryRunEmailSender`/`NewDryRunWhatsAppSender` (§4.11).
+**Stage 13 — `dryrun.go`. DONE.** `NewDryRunEmailSender`/`NewDryRunWhatsAppSender` (§4.11), exactly as specified.
 
-**Stage 14 — `events.go`: `grevents` integration.** Best-effort `message.sent`/`message.failed` publishing, nil-safe.
+**Stage 14 — `events.go`: `grevents` integration. DONE.** `TopicMessageSent`/`TopicMessageFailed`, `MessageSentPayload`/`MessageFailedPayload` carrying only `SendID` (the caller's own `IdempotencyKey`) + `Channel` — deliberately never the recipient address/number or message content, since an event bus is often subscribed to broadly and grpop's payloads are frequently security-sensitive. `PublishMessageSent`/`PublishMessageFailed` follow `grnoti`'s exact nil-bus/best-effort precedent (`PublishSent`/`PublishFailed`).
 
-**Stage 15 — `service.go`: orchestration.** `Service` wired to every prior stage. Direct dispatch, no broker (§4.4).
+**Stage 15 — `service.go`: orchestration. DONE, with two deliberate deviations from this plan's own §10 wiring example, both reasoned through during implementation:**
+
+1. **`ServiceDeps` has no `RateLimiter` field.** §10's wiring example passed the same `RateLimiter` to both a dispatcher's `Deps` *and* `ServiceDeps` — but `RateLimiter.Allow`/`Wait` consumes one token per call, and Service's own inline retry (below) calls `EmailSender.Send`/`WhatsAppSender.Send` more than once per logical send. Since `dispatcher.email.smtp.go`/`dispatcher.whatsapp.metacloud.go` already gate every individual `Send` attempt through their own configured `RateLimiter` (Stage 10/11), gating again in `Service` would silently consume two-to-four tokens for one logical send. Rate limiting is dispatcher-layer only now — configure it on `SMTPDispatcherDeps`/`MetaCloudDispatcherDeps`, not `ServiceDeps`. (This also finally resolves `ratelimiter.redis.go`'s own doc comment, written during Stage 9, that deferred the Redis rate limiter's fail-open/fail-closed policy to "Service, Stage 15" — the dispatcher's existing `Wait`-then-error-on-failure wiring already is that decision, fail-closed, made at the dispatcher layer rather than Service since Service ended up not owning rate limiting at all.)
+2. **`ServiceDeps` has no `EmailTemplateEngine` field.** Template rendering was moved into `dispatcher.email.smtp.go` itself during Stage 10 (`SMTPDispatcherDeps.TemplateEngine`) — `Service` never sees `TemplateName`/`InlineTemplate`, only the already-template-aware `EmailSender`.
+
+Beyond the plan's own text, two non-obvious behaviors worth recording here since they're easy to get wrong on a re-read of `service.go`:
+- **A delivery failure is reported via `SendResult.Status`, not the returned `error`** — `SendEmail`/`SendWhatsApp` return `(result, nil)` even after inline retries are exhausted and the event has been DLQ'd. This exactly mirrors `grnoti`'s own `processEvent` precedent (a `dispatchErr` is logged, not propagated, and the final `return result, nil` is unconditional) — the Go `error` return is reserved for pipeline-level failures (missing `IdempotencyKey`, a broken idempotency store, a permanent validation error), not "the vendor rejected this specific send."
+- **Permanent (validation-shaped) send errors are classified before retry/DLQ**, via `errors.Is` against grpop's own construction/validation sentinels (`ErrRecipientRequired`, `ErrNoContentModeSet`, etc. — see `isPermanentSendError`). These get zero inline retries, zero DLQ entries, zero lifecycle events, and — critically — **no idempotency mark**, so a caller can fix their bug and resend with the exact same key. Everything else (network errors, vendor 5xx, circuit-breaker rejections) is treated as transient: retried inline, then DLQ'd on exhaustion, with the idempotency key marked processed either way (a caller-side redelivery of the same key should never re-trigger a parallel attempt once `Service` has handed the failure to the DLQ for its own retry cycle).
 
 **Stage 16 — Polish.** `example/` runnable demo, README quickstart (§10), coverage gate, `docs/architecture.md`.
 
