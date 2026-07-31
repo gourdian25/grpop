@@ -1,3 +1,13 @@
 .
+├── LICENSE
+├── Makefile
+├── docs/
+│   └── plan/
+│       └── grpop-plan.md
+├── docs.go
+├── errors.go
+├── go.mod
+├── logger.go
+└── version.go
 
-0 directories, 0 files
+2 directories, 8 files
