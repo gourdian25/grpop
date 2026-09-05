@@ -11,9 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // DefaultDLQCollection is the collection name used when
@@ -129,9 +129,12 @@ func NewMongoDLQHandler(cfg MongoDLQHandlerConfig) (DLQHandler, error) {
 	maxRetryDelay := cfg.MaxRetryDelay
 	logger := OrNop(cfg.Logger)
 
+	// v2's mongo.Connect no longer takes a context or blocks on the network
+	// itself, so the 10s timeout that previously bounded Connect now bounds
+	// the Ping below instead -- Ping is the real connectivity check.
 	connectCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	client, err := mongo.Connect(connectCtx, options.Client().ApplyURI(cfg.URI))
+	client, err := mongo.Connect(options.Client().ApplyURI(cfg.URI))
 	if err != nil {
 		return nil, fmt.Errorf("grpop/mongo: connect: %w", errors.Join(err, ErrBackendUnavailable))
 	}
@@ -262,7 +265,7 @@ func (h *mongoDLQHandler) PublishToDLQ(ctx context.Context, sendID string, msg D
 			},
 			"$setOnInsert": setOnInsert,
 		},
-		options.Update().SetUpsert(true),
+		options.UpdateOne().SetUpsert(true),
 	)
 	if err != nil {
 		return fmt.Errorf("grpop/mongo: publish to dlq %s: %w", sendID, errors.Join(err, ErrBackendUnavailable))

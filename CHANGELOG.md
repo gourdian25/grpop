@@ -2,6 +2,35 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.0] - 2026-09-05
+
+Migrates the Mongo DLQ backend from `go.mongodb.org/mongo-driver` (v1,
+upstream-deprecated) to `go.mongodb.org/mongo-driver/v2`, matching
+grsentry's already-completed migration and bringing grpop in line with the
+rest of the `gourdian25` org. `MongoDLQHandlerConfig`/`NewMongoDLQHandler`
+never exposed a driver type in their exported signature, so this is an
+internal dependency swap only — no change to `NewMongoDLQHandler`'s
+signature or behavior for grpop's own consumers.
+
+### Changed
+
+- `dlq.mongo.go` now imports `go.mongodb.org/mongo-driver/v2/{bson,mongo,mongo/options}`.
+  `mongo.Connect` dropped its `context.Context` parameter in v2 (it never
+  blocked on the network — `Ping` remains the real connectivity check), so
+  the 10s connect timeout that used to bound `Connect` now bounds the
+  subsequent `Ping` call instead. v1's generic `options.Update()` is
+  removed in v2 (replaced by separate `options.UpdateOne()`/
+  `options.UpdateMany()` builders); `PublishToDLQ`'s upsert, paired with
+  `UpdateOne`, now uses `options.UpdateOne().SetUpsert(true)`.
+  `mongo.ErrNoDocuments`, `options.ReturnDocument`/`options.After`, and
+  `options.Index()`/`options.FindOneAndUpdate()` are unchanged.
+- `go.mod`: `go.mongodb.org/mongo-driver v1.17.9` replaced with
+  `go.mongodb.org/mongo-driver/v2 v2.8.0` as a direct dependency.
+  `github.com/gourdian25/grcache` (used by the `grcache`-backed
+  `IdempotencyStore` adapter) bumped from `v0.3.1` to `v0.5.0` to pick up
+  grcache's own v2 migration — v1 no longer appears anywhere in `go.mod`/
+  `go.sum`, direct or indirect.
+
 ## [0.1.0] - 2026-07-31
 
 ### Added
