@@ -1,5 +1,6 @@
 .
 ├── CHANGELOG.md
+├── CLAUDE.md
 ├── LICENSE
 ├── Makefile
 ├── README.md
@@ -24,6 +25,7 @@
 ├── docs/
 │   ├── architecture.md
 │   └── plan/
+│       ├── 2026-10-23-grpop-delivery-only.md
 │       └── grpop-plan.md
 ├── docs.go
 ├── dryrun.go
@@ -72,4 +74,4 @@
 ├── types.go
 └── version.go
 
-6 directories, 66 files
+6 directories, 68 files
