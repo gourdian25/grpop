@@ -15,7 +15,7 @@ backend to `mongo-driver/v2`; that backend is now removed.
 ### Added
 
 - `ErrPermanent`, `ErrInvalidAddress`, `MetaCloudDispatcherDeps.GraphAPIVersion`,
-  `EmailMessage.IdempotencyKey`.
+  `EmailMessage.IdempotencyKey`, `NewResendDispatcher`/`ResendDispatcherDeps`.
 
 ### Removed
 
@@ -57,6 +57,10 @@ backend to `mongo-driver/v2`; that backend is now removed.
   An invalid `SMTPDispatcherDeps.DefaultFrom` fails at construction.
 - **Logs:** the SMTP and dry-run senders log a recipient masked
   (`a***@example.com`), also inside an SMTP reply that echoes it.
+- **A Resend sender:** `NewResendDispatcher(ResendDispatcherDeps)` sends
+  through Resend's HTTP API (hand-rolled, no SDK). `EmailMessage.IdempotencyKey`
+  goes as Resend's `Idempotency-Key`, so a retried message is sent once
+  within 24 hours; refusals are classed from Resend's error reference.
 - **One email preparation step:** every email sender checks, renders and
   parses a message the same way (`prepareEmail`), so a second email vendor
   sends exactly what the SMTP sender would.

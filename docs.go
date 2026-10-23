@@ -27,16 +27,18 @@
 // # Package shape
 //
 // grpop's public API is a single flat package with no subpackages, every
-// vendor sender (a stdlib net/smtp-based email sender, a hand-rolled Meta
-// WhatsApp Cloud API client) distinguished by file-naming convention:
-// "dispatcher.<channel>.<vendor>.go" (dispatcher.email.smtp.go,
+// vendor sender (a stdlib net/smtp-based email sender, a hand-rolled Resend
+// API client, a hand-rolled Meta WhatsApp Cloud API client) distinguished by
+// file-naming convention: "dispatcher.<channel>.<vendor>.go"
+// (dispatcher.email.smtp.go, dispatcher.email.resend.go,
 // dispatcher.whatsapp.metacloud.go), since the dispatch layer has a
-// genuinely two-dimensional axis (channel x vendor).
+// genuinely two-dimensional axis (channel x vendor); dispatcher.email.go is
+// what every email sender shares.
 //
 // grpop has no third-party Go dependencies at all: email goes over plain
-// SMTP via the standard library, and WhatsApp goes directly against Meta's
-// Graph API over a hand-rolled net/http client, since Meta ships no
-// official Go SDK. Importing grpop pulls in no vendor-messaging SDK (no AWS
+// SMTP via the standard library or over Resend's API through a hand-rolled
+// net/http client, and WhatsApp goes directly against Meta's Graph API the
+// same way, since Meta ships no official Go SDK. Importing grpop pulls in no vendor-messaging SDK (no AWS
 // SDK, no Twilio, no SendGrid), no message-broker client and no storage
 // driver. A rate limiter is the caller's: RateLimiter is
 // grsentry's pkg/grlimiter.Limiter's method set, so that limiter (or any
@@ -57,8 +59,9 @@
 // mid-transaction either: on a timeout its goroutine is abandoned, not
 // stopped, and may still deliver. A caller that must not double-send needs
 // a vendor-side idempotency key; EmailMessage.IdempotencyKey is where it
-// goes. The SMTP sender can only derive a stable Message-ID from it, which
-// receiving systems may or may not use to drop a duplicate.
+// goes. The Resend sender passes it as Resend's Idempotency-Key, which Resend
+// honours for 24 hours. The SMTP sender can only derive a stable Message-ID
+// from it, which receiving systems may or may not use to drop a duplicate.
 //
 // ErrPermanent separates a failure that will recur on every attempt (a
 // malformed or unrenderable message, an unparseable address, an SMTP 5xx

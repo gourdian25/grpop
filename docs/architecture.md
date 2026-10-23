@@ -125,7 +125,25 @@ with idempotency gets it as is; the SMTP sender makes the `Message-ID` the
 key's SHA-256 at the sender's domain (`smtpMessageID`), the same on every
 attempt and never the key itself.
 
-### 3.5 Addresses are parsed, and logged masked
+### 3.5 Resend: a hand-rolled client, idempotent, classed by its error reference
+
+`NewResendDispatcher` (`dispatcher.email.resend.go`, 0.2.0 P4) posts one
+`POST /emails` per send, `net/http` and `encoding/json` only, like the Meta
+client: grpop takes no vendor SDK, and the SDK would add nothing to one POST.
+It builds the body from `prepareEmail`, so it sends what the SMTP sender
+would. `EmailMessage.IdempotencyKey` goes as Resend's `Idempotency-Key`
+(1 to 256 characters, kept 24 hours; a longer key as its SHA-256 hex), which
+makes a caller's retry safe within that window. Resend's reply is
+`{"id"}` on success and `{"message","name","statusCode"}` on a refusal (seen
+on 2026-10-24 with a request that carried no key). `resendErrorIsTemporary`
+classes a refusal from Resend's error reference: `429` (the per-second limit
+and the daily and monthly quotas), `5xx`, and a `409` other than
+`invalid_idempotent_request` are temporary; everything else is permanent.
+Addresses go as Resend's docs write them (`Name <address>`, quoted only when
+the name needs it, never RFC 2047-encoded, since the body is JSON). The API
+key is in the `Authorization` header and nowhere else.
+
+### 3.6 Addresses are parsed, and logged masked
 
 `From`, `To` and `Reply-To` go through `net/mail.ParseAddress`
 (`parseEmailAddress`), and a CR or LF anywhere is refused first: written
@@ -137,14 +155,14 @@ rate-limit key the bare address, and a bad `DefaultFrom` fails at
 construction. Log lines carry `maskEmail`'s `a***@example.com`, and an SMTP
 reply that echoes an address is masked before it is logged.
 
-### 3.6 The Meta Cloud API client: hand-rolled, narrow, fake-tested
+### 3.7 The Meta Cloud API client: hand-rolled, narrow, fake-tested
 
 `WhatsAppCloudAPIClient` is grpop's own thin interface over two Graph API
 endpoints (`SendTemplateMessage`, `GetApprovedTemplates`) — no official Go
 SDK exists for WhatsApp regardless of vendor, so a hand-rolled `net/http` +
 `encoding/json` client (`metaCloudAPIClient`) was always required. Sending
 uses `PhoneNumberID`; listing approved templates (which backs
-`TemplateValidator`, §3.7) needs the WhatsApp Business Account ID instead —
+`TemplateValidator`, §3.8) needs the WhatsApp Business Account ID instead —
 a separate ID Meta assigns, added to `MetaCloudDispatcherDeps` as
 `BusinessAccountID` during implementation once this distinction became
 concrete (the original plan draft didn't separate the two IDs). This is
@@ -157,7 +175,7 @@ real local `httptest.Server` (not Meta itself, but a real HTTP round trip). Ever
 `v26.0`; Meta retires a version about two years after release, and the
 earlier hard-coded `v20.0` stopped on 2026-09-24).
 
-### 3.7 `TemplateValidator`: advisory, TTL-cached, never a false negative
+### 3.8 `TemplateValidator`: advisory, TTL-cached, never a false negative
 
 Meta requires every WhatsApp template to go through approval before use;
 `TemplateValidator.Validate` checks both approval status and that
@@ -175,7 +193,7 @@ so the cache can only ever produce a false *positive* window (a
 since-revoked template briefly still looks approved), never a false
 negative that blocks a send that would have succeeded.
 
-### 3.8 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
+### 3.9 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
 
 `SMTPClient` (`Auth`/`Mail`/`Rcpt`/`Data`/`Close`) is satisfied directly by
 `*net/smtp.Client` — no adapter type needed. `SMTPDialer.Dial` performs the
@@ -210,6 +228,8 @@ recipient key and the fail-closed policy carry over to `checkRateLimits`
 
 The SMTP sender is tested against a **real local Mailpit** (`t.Skip`-ing
 when it isn't reachable) as well as a fake `SMTPClient`; `-race` is
-mandatory. The Meta Cloud API client is the one documented exception
-(§3.6): a fake client for the sender's wiring, an `httptest.Server` for the
+mandatory. The Resend sender is tested against a local `httptest` fake of
+its API, plus one live test that runs only with `GRPOP_TEST_RESEND_API_KEY`
+set. The Meta Cloud API client is the one documented exception
+(§3.7): a fake client for the sender's wiring, an `httptest.Server` for the
 real HTTP client. `make coverage-check` gates the package at 95%.

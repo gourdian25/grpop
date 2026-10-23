@@ -6,7 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `grpop` (module `github.com/gourdian25/grpop`) is a Go library: send-only,
 transactional-message delivery over email (stdlib `net/smtp`, any SMTP vendor)
-and WhatsApp (Meta Cloud API, hand-rolled `net/http` client). It sends messages
+or Resend's API (hand-rolled `net/http` client), and WhatsApp (Meta Cloud
+API, hand-rolled `net/http` client). It sends messages
 and does not receive them (not POP3), handles no push notifications (that's
 `grnoti`), and has no notion of users or preferences. The caller passes the
 recipient on every send. It is one flat public package (`package grpop`, every
@@ -98,6 +99,14 @@ against a fake `WhatsAppCloudAPIClient`, and the real HTTP client against an
 
 **Vendors:**
 
+- **Resend** (`dispatcher.email.resend.go`): one `POST /emails` per send,
+  built from `prepareEmail`; `EmailMessage.IdempotencyKey` goes as
+  `Idempotency-Key` (SHA-256 hex past 256 characters); a refusal is
+  `{"message","name","statusCode"}` and `resendErrorIsTemporary` classes it
+  (`429`, `5xx` and a `409` other than `invalid_idempotent_request` are
+  temporary). The API key goes in the `Authorization` header only. Its tests
+  use an `httptest` fake; `TestResendDispatcher_Live` runs only with
+  `GRPOP_TEST_RESEND_API_KEY` set.
 - **SMTP:** `net/smtp` can't be cancelled, so `transact` races the whole
   dial-to-close transaction against a timer and abandons the goroutine on
   timeout, which may still deliver. This is documented and deliberate.

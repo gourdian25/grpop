@@ -5,8 +5,8 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Send-only, multi-channel transactional-messaging delivery library for the
-gourdian ecosystem (`github.com/gourdian25/grpop`): email (stdlib SMTP) and
-WhatsApp (Meta Cloud API, direct) senders that each **send one message once
+gourdian ecosystem (`github.com/gourdian25/grpop`): email (stdlib SMTP, or
+Resend's API) and WhatsApp (Meta Cloud API, direct) senders that each **send one message once
 and report what the vendor said**, with templates, optional circuit breaking
 and optional per-channel and per-recipient rate limiting through a limiter
 you supply. No third-party Go dependencies.
@@ -59,9 +59,10 @@ go get github.com/gourdian25/grpop
 
 None outside the standard library. Email goes over `net/smtp`, so any
 SMTP-speaking vendor (SES, SendGrid, Postmark, Mailgun, Resend's
-`smtp.resend.com`, a bare relay) is a config value, not a Go dependency.
-WhatsApp goes directly against Meta's Graph API over a hand-rolled
-`net/http` client (Meta ships no official Go SDK). There is no rate-limiter
+`smtp.resend.com`, a bare relay) is a config value, not a Go dependency, or
+over Resend's HTTP API through a hand-rolled `net/http` client (no Resend
+SDK). WhatsApp goes directly against Meta's Graph API the same way (Meta
+ships no official Go SDK). There is no rate-limiter
 implementation to pull in: `RateLimiter` is one method, and you pass your
 own.
 
@@ -98,6 +99,17 @@ case errors.Is(err, grpop.ErrPermanent):
 default:
     // temporary: your retry tries again later
 }
+```
+
+The Resend sender takes the same `EmailMessage` and renders it the same way;
+pick it instead of SMTP to get Resend's idempotency (below) and its email id:
+
+```go
+sender, err := grpop.NewResendDispatcher(grpop.ResendDispatcherDeps{
+    APIKey:         os.Getenv("RESEND_API_KEY"),
+    DefaultFrom:    "Acme <no-reply@acme.test>", // a domain verified in Resend
+    TemplateEngine: engine,
+})
 ```
 
 See [example/main.go](example/main.go) and
@@ -141,6 +153,7 @@ recipients, and many callers aiming at one. A refused send returns
 | Backend | Constructor |
 |---|---|
 | SMTP (any vendor) | `NewSMTPDispatcher(SMTPDispatcherDeps)` |
+| Resend's HTTP API | `NewResendDispatcher(ResendDispatcherDeps)` |
 | In-memory (tests/dev) | `NewMemoryEmailSender()` |
 | Dry run (staging, redacted logging) | `NewDryRunEmailSender(Logger)` |
 
@@ -198,10 +211,18 @@ fail the same way on every attempt matches it, and nothing else does.
   4, 80007, 130429, 131000, 131016, 131056, 133004, 2494100).
 
 **`EmailMessage.IdempotencyKey`** (optional) is the same value on every
-attempt at one message, an outbox row's id say. The SMTP sender makes the
-`Message-ID` its SHA-256 (the key itself never appears in the message), so a
-retried message carries the same `Message-ID`; SMTP can do no more than
-that. Never give two different messages one key.
+attempt at one message, an outbox row's id say. The Resend sender sends it as
+Resend's `Idempotency-Key` header, so Resend sends a retried message once
+within 24 hours (a key over 256 characters goes as its SHA-256). The SMTP
+sender makes the `Message-ID` its SHA-256 (the key itself never appears in
+the message), so a retried message carries the same `Message-ID`; SMTP can
+do no more than that. Never give two different messages one key.
+
+The Resend sender classes Resend's refusals by its error reference: a `429`
+(the rate limit and the daily and monthly quotas), a `5xx`, and a `409` for a
+request with the same key still running are temporary; every other refusal
+(an invalid field or key, an unverified sender domain, the same key with a
+different body) is permanent.
 
 `ErrInvalidAddress` covers a `From`, `To` or `Reply-To` that `net/mail` can't
 parse or that carries a line break (which would add a header of its own); it
@@ -243,7 +264,11 @@ complete list this draws from.
 ## Testing
 
 The SMTP sender's integration test runs against a real local Mailpit (it
-skips when Mailpit is down, which drops coverage below the 95% gate):
+skips when Mailpit is down, which drops coverage below the 95% gate). The
+Resend sender is tested against a local fake of its API; one live test sends
+to Resend's `delivered@resend.dev` only when `GRPOP_TEST_RESEND_API_KEY` is
+set (`GRPOP_TEST_RESEND_FROM` picks the sender, default
+`onboarding@resend.dev`):
 
 ```sh
 make docker-up   # Mailpit

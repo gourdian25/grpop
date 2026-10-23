@@ -11,8 +11,8 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 | P1 | Remove what isn't delivery: `Service`, the idempotency store, the DLQ (memory, Postgres, Mongo), `MessageEncryptor`, `Service`'s lifecycle events, and grpop's own rate limiters (`RateLimiter` becomes `grlimiter.Limiter`'s shape) | **Done** 2026-10-23 |
 | P2 | Fix what is left: one permanent-vs-temporary error check callers use, safe addresses, masked emails in logs, the Meta API version as config | **Done** 2026-10-23 |
 | P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | **Done** 2026-10-23 |
-| P4 | The Resend sender over `net/http` (no SDK) | **Next** |
-| P5 | Release `v0.2.0` | To do |
+| P4 | The Resend sender over `net/http` (no SDK) | **Done** 2026-10-24 |
+| P5 | Release `v0.2.0` | **Next** |
 | P6 | WhatsApp completion: header and media parameters, buttons (URL, copy-code), named parameters, Meta's current API version, a live smoke test | To do, after grsentry's M1 (M1 needs email only) |
 
 ## The decisions (the user's, 2026-10-23)
@@ -117,7 +117,7 @@ grpop builds and vets against grcache `v0.6.0` (grsentry's), checked on a copy; 
 - **Gate:** all green: gofmt, build and vet (both ways), `go mod tidy -diff`, `make precommit` (lint 0 issues, `-race`, coverage 97.1%) with a throwaway Mailpit (no skips; removed `-v`), `bark check` (`bark tree` for the two new files). `go run ./example` sent all four, and Mailpit's Message-IDs were the keys' hashes.
 - **Mutants:** 8 of 8 caught, the control green: the key ignored; the raw key as the Message-ID; `prepareEmail` dropping the key; the default sender ignored; the Reply-To dropped; an inline template rendered as a registered one; validation skipped; the SMTP sender preparing something other than the message.
 
-## P4: the Resend sender
+## P4: the Resend sender (done)
 
 `dispatcher.email.resend.go`, `NewResendDispatcher(ResendDispatcherDeps) (EmailSender, error)`, a hand-rolled `net/http` client like the Meta one.
 
@@ -129,6 +129,19 @@ grpop builds and vets against grcache `v0.6.0` (grsentry's), checked on a copy; 
   - The body's `name` and `message` go into the error; its exact JSON shape is confirmed when the stage starts with one unauthenticated request (`401 missing_api_key` needs no account).
 - **Tests:** an `httptest` server, like `dispatcher.whatsapp.metacloud_http_test.go`: the request's method, path, headers and body; the idempotency key, long and short; every status class above; a timeout and a cancelled context; the limiter and breaker gating every send; nothing secret in a log. A live smoke test runs only with `GRPOP_TEST_RESEND_API_KEY` set (it skips otherwise), sending to Resend's test address `delivered@resend.dev` (`bounced@resend.dev` answers like a `550`).
 - **Mutants:** the idempotency header dropped; a `422` classed temporary; a `429` classed permanent; the key logged; `prepareEmail` bypassed.
+
+*P4 as built (2026-10-24):*
+- **Resend's error body, checked first:** one `POST https://api.resend.com/emails` with no key answered `401 {"message":"Missing API Key","name":"missing_api_key","statusCode":401}`, and one with a malformed key `401 {"message":"API key is invalid","name":"validation_error","statusCode":401}`. No account, no data sent.
+- **`dispatcher.email.resend.go`** (new): `NewResendDispatcher(ResendDispatcherDeps)` with `APIKey` (required), `BaseURL`, `DefaultFrom`, `Timeout` (15 s), `HTTPClient`, `TemplateEngine`, both limiters, `CircuitBreaker`, `Metrics`, `Logger`; it refuses a missing key, a non-http(s) base URL and a bad `DefaultFrom`. `Send` starts from `prepareEmail`, checks the limiters, posts `{from, to, subject, html, text, reply_to}` inside the breaker, and returns Resend's `id`.
+  - `Idempotency-Key` is the message's key, or its SHA-256 hex past Resend's 256 characters; no key, no header.
+  - `resendErrorIsTemporary`: `429`, `5xx` and a `409` other than `invalid_idempotent_request` are temporary; every other refusal permanent. A network failure, a timeout and a success body without an `id` are temporary.
+  - Addresses as Resend's docs write them (`resendAddress`): `Name <address>` for a plain name, quoted and escaped otherwise, never RFC 2047-encoded.
+  - The API key only in the `Authorization` header; logs mask addresses and redact them inside Resend's message; `Close` releases only a client it made.
+- **Docs:** README (the sender, its key and its error classes, the live test), `docs.go`, `docs/architecture.md` (a new §3.5, sections renumbered), `CLAUDE.md`, the CHANGELOG.
+- **Tests** (`dispatcher.email.resend_test.go`, new, against an `httptest` fake): construction refusals; the request's method, path, headers and body; the idempotency header (none, long); 12 refusal classes; a timeout, a refused connection, a body without an id, a cancelled context; refusals before any call (a bad address, a limiter, an open breaker); templates rendered; neither the key nor a full address in a log line or the error; `resendAddress` round-trips through `net/mail`. `TestResendDispatcher_Live` sends to `delivered@resend.dev` only with `GRPOP_TEST_RESEND_API_KEY` set; it was not run (no key here).
+- **Gate:** all green: gofmt, build and vet (both ways), `go mod tidy -diff`, `make precommit` (lint 0 issues, `-race`, coverage 97.1%) with a throwaway Mailpit (the one skip is the live Resend test; removed `-v`), `bark check` (`bark tree` for the two new files); `go run ./example` sent all four over SMTP.
+- **Mutants:** 11 of 11 caught, each building, the control green: the idempotency header dropped; a `422` temporary; a `429` permanent; the key logged; `prepareEmail` bypassed; every `409` temporary; a long key sent raw; names never quoted; the breaker bypassed; the limiters skipped; Resend's message logged unredacted.
+- **Not proven here:** that Resend accepts the request as built. The live test does that the first time it runs with a key; until then, the shape rests on Resend's API reference and the fake.
 
 ## P5: release v0.2.0
 

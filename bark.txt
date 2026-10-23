@@ -7,6 +7,8 @@
 ├── circuitbreaker.go
 ├── circuitbreaker_test.go
 ├── dispatcher.email.go
+├── dispatcher.email.resend.go
+├── dispatcher.email.resend_test.go
 ├── dispatcher.email.smtp.go
 ├── dispatcher.email.smtp_mailpit_test.go
 ├── dispatcher.email.smtp_test.go
@@ -47,4 +49,4 @@
 ├── types.go
 └── version.go
 
-3 directories, 44 files
+3 directories, 46 files
