@@ -1,4 +1,4 @@
-# grpop: delivery only, a Resend sender, then WhatsApp completed (staged plan)
+# grpop: delivery only, a Resend sender, WhatsApp completed, then the release (staged plan)
 
 Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "next"; each stage ends with the gate, a report and a commit message, and the user commits. grpop is a library, so there is no twin: the proof is the gate, the backend tests (Redis, Mailpit) and, from P2 on, a mutation run.
 
@@ -12,8 +12,10 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 | P2 | Fix what is left: one permanent-vs-temporary error check callers use, safe addresses, masked emails in logs, the Meta API version as config | **Done** 2026-10-23 |
 | P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | **Done** 2026-10-23 |
 | P4 | The Resend sender over `net/http` (no SDK) | **Done** 2026-10-24 |
-| P5 | Release `v0.2.0` | **Next** |
-| P6 | WhatsApp completion: header and media parameters, buttons (URL, copy-code), named parameters, Meta's current API version, a live smoke test | To do, after grsentry's M1 (M1 needs email only) |
+| P5 | WhatsApp messages: typed components (header, body, buttons; named or positional), the OTP helper, phone and value checks, and the breaker counting only temporary failures | **Next** |
+| P6 | The template validator, usable and truthful: an exported Meta client, paginated listing, component-aware counts, advisory when the listing fails; a live Meta smoke test | To do |
+| *grsentry* | M1a–M1d on this untagged grpop: `../go.work` in workspace mode, a pseudo-version of a pushed `master` commit for `GOWORK=off` and CI. A change M1 needs here becomes a stage of its own | To do |
+| P7 | Release `v0.2.0` once grsentry runs on it and grpop needs nothing more: the CHANGELOG dated, `make prerelease`, the user tags; grsentry moves from the pseudo-version to the tag | To do, last |
 
 ## The decisions (the user's, 2026-10-23)
 
@@ -21,7 +23,12 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 - **So everything that retried or stored goes,** not only the retry: `Service`'s inline retry and the DLQ that caught its failures, and with them `Service` itself, whose one remaining job, the duplicate check, an outbox does not need (its row records the send, and Resend's `Idempotency-Key` covers the vendor). `FullJitterBackoff` stays, exported, for a caller's own retry loop.
 - **Order: remove, fix, refactor, add.** Four of the seven problems found on 2026-10-23 live in code P1 deletes, so they are deleted rather than fixed.
 - **Resend over `net/http`, no SDK,** beside SMTP; the caller picks one. grpop's dispatch layer keeps zero vendor SDKs (the Meta client is hand-rolled the same way). Resend over SMTP (`smtp.resend.com`) also works with the SMTP sender as it is, with no code.
-- **grpop stays a standalone library, WhatsApp included and completed (P6)** (the user, 2026-10-23, after weighing a move into grsentry's `pkg/` as `grmail`). With three vendor senders it is more than a wrapper, the vendors change on their own schedule (Meta retires a Graph API version about every two years), and its tests (a fake Meta server, Mailpit, a Resend live test behind a key) don't fit grsentry's offline-unit-tests rule. P6 comes after grsentry's M1: administrators have only an optional, unverified profile phone; tenant users have verified ones.
+- **grpop stays a standalone library, WhatsApp included and completed (P5, P6)** (the user, 2026-10-23, after weighing a move into grsentry's `pkg/` as `grmail`). With three vendor senders it is more than a wrapper, the vendors change on their own schedule (Meta retires a Graph API version about every two years), and its tests (a fake Meta server, Mailpit, a Resend live test behind a key) don't fit grsentry's offline-unit-tests rule.
+- **The order, revised (the user, 2026-10-24):** WhatsApp is completed now (P5, P6), not after grsentry's M1; grsentry then integrates over `../go.work` on the untagged grpop; the tag (P7) comes last, once grsentry runs on it and grpop needs no more changes.
+- **Typed WhatsApp components replace `TemplateVariables`** (2026-10-24; breaking, but 0.2.0 is unreleased): one way to say what a template needs, with no positional-key gaps.
+- **The template validator stays advisory** (2026-10-24): with no fresh list it uses the last one it had, or lets the send through with a warning; Meta decides.
+- **grsentry builds on the untagged grpop through a pseudo-version** (2026-10-24): the user pushes grpop's `master` without a tag and grsentry's `go.mod` requires that commit (`go get github.com/gourdian25/grpop@<commit>`), so `GOWORK=off` builds, CI and `make e2e` get the same code the workspace uses from `../grpop`. P7's tag replaces it.
+- **The circuit breaker counts only temporary failures** (2026-10-24, P2's open point): a permanent failure is about one message, not the vendor's health, and a burst of `550`s for bad addresses must not block every recipient.
 - **No rate limiter of grpop's own** (the user, 2026-10-23: reuse grsentry's `grlimiter`). Importing `grsentry/pkg/grlimiter` would make the two modules require each other and pull grsentry's dependencies (gin, through its middleware) into grpop. Instead `RateLimiter` takes `grlimiter.Limiter`'s exact shape, `Allow(ctx, key) (bool, error)`, so grsentry passes its limiter in with no adapter and no import either way. grpop's in-process and Redis limiters and their LRU go (P1). grpop then depends on the standard library alone.
 
 **The problems found (2026-10-23, from the code; 1 to 4 proven by a throwaway test on a copy):**
@@ -143,18 +150,95 @@ grpop builds and vets against grcache `v0.6.0` (grsentry's), checked on a copy; 
 - **Mutants:** 11 of 11 caught, each building, the control green: the idempotency header dropped; a `422` temporary; a `429` permanent; the key logged; `prepareEmail` bypassed; every `409` temporary; a long key sent raw; names never quoted; the breaker bypassed; the limiters skipped; Resend's message logged unredacted.
 - **Not proven here:** that Resend accepts the request as built. The live test does that the first time it runs with a key; until then, the shape rests on Resend's API reference and the fake.
 
-## P5: release v0.2.0
+## What the WhatsApp code lacks (read 2026-10-24)
 
-`CHANGELOG.md`'s `[0.2.0]` entry (dated, listing the breaking removals and the additions), `version.go`, the README, `make prerelease`. Tagging and publishing (`make release VERSION=v0.2.0`) is outward-facing: the user runs it or says to. grsentry then requires `github.com/gourdian25/grpop v0.2.0`.
+- **Only body text values, positional,** from `TemplateVariables map[string]string` keyed "1","2",…; a gap silently cuts the list (`positionalTemplateParameters`). No header (text, image, video, document, location), no buttons, no named parameters, no currency or date-time values. So no authentication (OTP) template can be sent: Meta's copy-code send puts the code in the body *and* as URL button `index "0"` (Meta's copy-code page, read 2026-10-24).
+- **The template validator can't be wired to Meta by a caller:** it needs a `WhatsAppCloudAPIClient`, and the only real one (`newRealWhatsAppCloudAPIClient`) is unexported.
+- **The validator can block a send Meta would accept, against its own doc:**
+  - the listing reads one page (`limit=200`, no `paging`), so a template past it reads as not approved, a permanent error;
+  - `countTemplateParameters` stops at `{{20}}` and counts named placeholders as 0;
+  - a failed listing fails the send.
+- **Nothing checks `To`:** any string goes to Meta.
 
-## P6: WhatsApp completion (after grsentry's M1)
-Checked against Meta's Cloud API reference when the stage starts.
-- **Every component a template can take:** header parameters (text, image, document, video), body parameters, and buttons (a URL button's dynamic suffix, quick replies, and the copy-code button Meta's authentication templates require).
-- **Named parameters** beside positional ones (`parameter_name`), with the template validator counting each kind.
-- **The API version** (P2's config field) defaulting to Meta's current one.
-- **A gap in positional values is an error** (`ErrWhatsAppTemplateArityMismatch`, permanent), not a silent stop at the gap as `positionalTemplateParameters` does today.
-- **Tests:** the fake Meta server for every component; a live smoke test only with `GRPOP_TEST_META_*` set (it skips otherwise).
-- **Then release** `v0.3.0` the same way as P5.
+Meta's reference, read 2026-10-24, confirms:
+- the copy-code send shape (the code at most 15 characters);
+- the URL button send with `parameter_name`;
+- the location header;
+- the component limits: a text header at most 60 characters, a body at most 1024, URL buttons at most 2, copy code at most 1, buttons at most 10.
+
+Meta's docs have moved (`developers.facebook.com/documentation/business-messaging/whatsapp/`), and the pages read did not show the body, text-header and media-header parameter shapes or the quick-reply and coupon-code ones. P5 starts by confirming them, and the live test (P6) proves the payload against Meta.
+
+## P5: WhatsApp messages (next)
+
+- **`types.go`:** `WhatsAppMessage` keeps `To`, `TemplateName`, `LanguageCode` and replaces `TemplateVariables` with:
+  - `Header *WhatsAppParameter`: a text, image, video, document or location value, one per template;
+  - `Body []WhatsAppParameter`: in order for a positional template, each named (`Name`) for a named one, never mixed;
+  - `Buttons []WhatsAppButton`: `{Index int, Kind (URL | QuickReply | CopyCode), Value string}`, where `Value` is the URL suffix, the payload or the coupon code.
+- **`WhatsAppParameter`** holds exactly one value: `Text`; `Currency{FallbackValue, Code, Amount1000}`; `DateTime{FallbackValue}`; `Media{Kind image|video|document, ID or Link, Filename}`; or `Location{Latitude, Longitude, Name, Address}`. It also holds `Name` for a named template.
+- **Constructors:** `WhatsAppText`, `WhatsAppNamedText`, `WhatsAppImage`, … and `WhatsAppOTP(code)`. The OTP one returns the body value and URL button 0 holding the code, Meta's authentication-template shape.
+- **Checks** (`payloadvalidator.go`, all permanent, before any call; the limits re-read from Meta's reference first):
+  - `To` is an optional `+` then 8–15 digits, otherwise the new `ErrInvalidPhoneNumber`;
+  - each parameter holds exactly one value;
+  - named and positional values aren't mixed;
+  - a text header is at most 60 characters;
+  - a body text value has no newline or tab and no run of more than four spaces;
+  - an OTP code is at most 15 characters;
+  - a button index is 0–9 and used once;
+  - a media value names an `ID` or a `Link`.
+
+  The parameter failures are the new `ErrWhatsAppParameterInvalid`, which names the field, never the value.
+- **`dispatcher.whatsapp.metacloud.go`:**
+  - `WhatsAppCloudAPIRequest` carries the components;
+  - the real client builds Meta's `components` (`header`, `body`, `button` with `sub_type`, a string `index` and typed `parameters`);
+  - `positionalTemplateParameters` goes;
+  - `MemoryWhatsAppSender` and the dry run adapt (the dry run logs the template and the counts, never a value).
+- **The circuit breaker counts only temporary failures,** in all three senders, through a small helper over `CircuitBreaker.Execute`. A permanent failure is returned unchanged and not counted.
+- **Tests:**
+  - the exact JSON for every component kind against the `httptest` server, copy-code OTP included (the code twice);
+  - every check refused before a call;
+  - named versus positional;
+  - ten permanent failures leave the breaker closed, and temporary ones then open it.
+- **Mutants** (on a copy, each built first):
+  - the OTP button dropped;
+  - the index sent as a number;
+  - a newline allowed in a body value;
+  - the phone check skipped;
+  - a permanent failure counted by the breaker;
+  - named and positional values mixed.
+
+## P6: the template validator, usable and truthful
+
+- **An exported client:** `NewMetaCloudAPIClient(MetaCloudAPIClientConfig{PhoneNumberID, BusinessAccountID, AccessToken, GraphAPIVersion, Timeout})`. The dispatcher uses it when `Client` is nil, and a caller hands the same client to `NewMetaTemplateValidator`.
+- **The listing:**
+  - `GetApprovedTemplates` follows `paging` to the end, with a hard page cap so a loop can't run away;
+  - it asks for `status=APPROVED`;
+  - it reads `parameter_format` when Meta returns it.
+- **`WhatsAppTemplateInfo`** gains the header kind and whether it takes a value, the body's positional count or named set, and the URL buttons that take a value. Placeholders are counted with a regexp: no `{{20}}` cap, and named ones counted too. `Validate` compares the message's components with them; a mismatch is `ErrWhatsAppTemplateArityMismatch`, naming what differs.
+- **Advisory when the listing fails:** `Validate` uses the last good list if it has one, and otherwise lets the send through. Either way it logs a warning and leaves Meta as the authority.
+- **A live smoke test:** it runs only with `GRPOP_TEST_META_PHONE_NUMBER_ID`, `GRPOP_TEST_META_ACCESS_TOKEN` and `GRPOP_TEST_META_TO` set (and optionally `GRPOP_TEST_META_BUSINESS_ACCOUNT_ID`, to validate first), and skips otherwise. It sends Meta's `hello_world` sample template (`en_US`, no values).
+- **Tests:**
+  - three fake pages, with a template on the third approved;
+  - named and positional counts, and `{{25}}`;
+  - header and button arity;
+  - a failed refresh with and without a cached list;
+  - the exported client used by both the dispatcher and the validator.
+- **Mutants:**
+  - the listing stopping at page one;
+  - the `{{20}}` cap back;
+  - named placeholders uncounted;
+  - a failed refresh blocking the send;
+  - the approved filter dropped.
+
+## P7: release v0.2.0 (last)
+
+After grsentry's M1 runs on grpop and no more grpop change is needed:
+- the CHANGELOG's `[0.2.0]` entry dated;
+- `version.go`;
+- the README's status line;
+- `make prerelease`;
+- the live Resend and Meta tests run with the user's keys, so the tag ships with both vendors proven.
+
+Tagging and publishing (`make release VERSION=v0.2.0`) is outward-facing: the user runs it or says to. grsentry's `go.mod` then moves from the pseudo-version to `v0.2.0`.
 
 ## Known and accepted
 
@@ -166,5 +250,5 @@ Checked against Meta's Cloud API reference when the stage starts.
 ## How to prove a stage
 
 - **The gate:** `gofmt -l .`, `go build ./... && go vet ./...`, `GOWORK=off go build ./...`, `GOWORK=off go mod tidy -diff`, `make precommit` (fmt, vet, lint, race, coverage at or above 95%), `bark check` (`bark tree` when a file is added or removed). The Mailpit test skips when Mailpit is down, which drops coverage below the gate: start it first and read the output for skips.
-- **Mutants** (P2 to P4): on a copy of the repo, never the working tree; an unmutated control first; read each failing run for which test caught it.
+- **Mutants** (P2 to P6): on a copy of the repo, each confirmed to build first, never the working tree; an unmutated control first; read each failing run for which test caught it.
 - **Never on the working tree** for a quick check: a throwaway test goes in a copy.
