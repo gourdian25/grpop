@@ -16,9 +16,18 @@ backend to `mongo-driver/v2`; that backend is now removed.
 
 - `ErrPermanent`, `ErrInvalidAddress`, `MetaCloudDispatcherDeps.GraphAPIVersion`,
   `EmailMessage.IdempotencyKey`, `NewResendDispatcher`/`ResendDispatcherDeps`.
+- Typed WhatsApp values: `WhatsAppMessage.Header`, `Body` and `Buttons`;
+  `WhatsAppParameter`, `WhatsAppCurrency`, `WhatsAppDateTime`,
+  `WhatsAppMedia` (`WhatsAppMediaKind`), `WhatsAppLocation`, `WhatsAppButton`
+  (`WhatsAppButtonKind`: URL, quick reply, copy code, one-time code); the
+  constructors `WhatsAppText`, `WhatsAppNamedText`, `WhatsAppImage`,
+  `WhatsAppVideo`, `WhatsAppDocument` and `WhatsAppOTP`.
+- `ErrInvalidPhoneNumber` and `ErrWhatsAppParameterInvalid`, both permanent.
 
 ### Removed
 
+- `WhatsAppMessage.TemplateVariables` and
+  `WhatsAppCloudAPIRequest.TemplateVariables`: `Body` replaces them.
 - `Service`, `NewService`, `ServiceDeps`, `ServiceConfig`,
   `DefaultServiceConfig`, `SendOptions` and `SendResult.Duplicate`.
 - `IdempotencyStore` and `NewCacheIdempotencyStore`.
@@ -68,6 +77,19 @@ backend to `mongo-driver/v2`; that backend is now removed.
   one message. The SMTP sender makes the `Message-ID` its SHA-256, so a
   retried message carries the same `Message-ID`; without a key it stays
   random.
+- **WhatsApp messages carry every value kind Meta takes.** Before, only
+  positional body text could be sent, so no authentication (one-time code)
+  template could, and a gap in `TemplateVariables`' keys silently cut the
+  list. `WhatsAppMessage.To` must be in international form, and every value
+  is checked against Meta's send-time rules before the call.
+- **`TemplateValidator.Validate(ctx, msg WhatsAppMessage)`** takes the
+  message (was name, language and the variables map).
+- **The circuit breaker counts only temporary failures**, in every sender:
+  a permanent one is recorded as the vendor answering, so a run of bad
+  addresses no longer opens it. The SMTP sender classes a `5xx` inside the
+  breaker for this.
+- **The WhatsApp dry run** also logs whether there is a header and how many
+  body values and buttons there are, never a value.
 - **Meta Graph API version:** `MetaCloudDispatcherDeps.GraphAPIVersion`,
   default `v26.0`. The hard-coded `v20.0` stopped being served on
   2026-09-24.

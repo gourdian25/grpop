@@ -59,7 +59,7 @@ type fakeTemplateValidator struct {
 	refreshCalls  int
 }
 
-func (v *fakeTemplateValidator) Validate(_ context.Context, _, _ string, _ map[string]string) error {
+func (v *fakeTemplateValidator) Validate(_ context.Context, _ WhatsAppMessage) error {
 	v.validateCalls++
 	return v.validateErr
 }
@@ -70,10 +70,10 @@ func (v *fakeTemplateValidator) Refresh(_ context.Context) error {
 
 func validWhatsAppMessage() WhatsAppMessage {
 	return WhatsAppMessage{
-		To:                "15551234567",
-		TemplateName:      "order_confirmation",
-		LanguageCode:      "en_US",
-		TemplateVariables: map[string]string{"1": "Ada", "2": "12345"},
+		To:           "15551234567",
+		TemplateName: "order_confirmation",
+		LanguageCode: "en_US",
+		Body:         []WhatsAppParameter{WhatsAppText("Ada"), WhatsAppText("12345")},
 	}
 }
 
@@ -111,6 +111,9 @@ func TestMetaCloudDispatcher_Send_ValidatesMessage(t *testing.T) {
 		{"no recipient", WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"}, ErrRecipientRequired},
 		{"no template name", WhatsAppMessage{To: "15551234567", LanguageCode: "en_US"}, ErrWhatsAppTemplateNameRequired},
 		{"no language code", WhatsAppMessage{To: "15551234567", TemplateName: "t"}, ErrWhatsAppLanguageCodeRequired},
+		{"a number with spaces", WhatsAppMessage{To: "+1 555 123 4567", TemplateName: "t", LanguageCode: "en_US"}, ErrInvalidPhoneNumber},
+		{"a value with a line break", WhatsAppMessage{To: "15551234567", TemplateName: "t", LanguageCode: "en_US", Body: []WhatsAppParameter{WhatsAppText("a\nb")}}, ErrWhatsAppParameterInvalid},
+		{"a one-time code the body lacks", WhatsAppMessage{To: "15551234567", TemplateName: "t", LanguageCode: "en_US", Buttons: []WhatsAppButton{{Kind: WhatsAppButtonOTP, Value: "1"}}}, ErrWhatsAppParameterInvalid},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -247,29 +250,6 @@ func TestMetaCloudDispatcher_Send_CircuitBreakerOpensAfterFailure(t *testing.T) 
 	}
 	if client.calls() != 1 {
 		t.Fatalf("client.calls() = %d, want 1 (circuit breaker should have short-circuited the second Send)", client.calls())
-	}
-}
-
-func TestPositionalTemplateParameters(t *testing.T) {
-	params := positionalTemplateParameters(map[string]string{"1": "a", "2": "b", "3": "c"})
-	if len(params) != 3 {
-		t.Fatalf("len(params) = %d, want 3", len(params))
-	}
-	if params[0].Text != "a" || params[1].Text != "b" || params[2].Text != "c" {
-		t.Fatalf("params = %+v, want ordered a,b,c", params)
-	}
-}
-
-func TestPositionalTemplateParameters_StopsAtGap(t *testing.T) {
-	params := positionalTemplateParameters(map[string]string{"1": "a", "3": "c"})
-	if len(params) != 1 {
-		t.Fatalf("len(params) = %d, want 1 (positional params must be contiguous from \"1\")", len(params))
-	}
-}
-
-func TestPositionalTemplateParameters_Empty(t *testing.T) {
-	if params := positionalTemplateParameters(nil); len(params) != 0 {
-		t.Fatalf("len(params) = %d, want 0", len(params))
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -47,7 +48,7 @@ func TestMetaCloudAPIClient_SendTemplateMessage_Success(t *testing.T) {
 	client := newTestMetaCloudAPIClient(server.URL)
 	resp, err := client.SendTemplateMessage(context.Background(), WhatsAppCloudAPIRequest{
 		To: "15551234567", TemplateName: "greeting", LanguageCode: "en_US",
-		TemplateVariables: map[string]string{"1": "Ada"},
+		Body: []WhatsAppParameter{WhatsAppText("Ada")},
 	})
 	if err != nil {
 		t.Fatalf("SendTemplateMessage: %v", err)
@@ -265,5 +266,125 @@ func TestNewMetaCloudWhatsAppDispatcher_GraphAPIVersion(t *testing.T) {
 		if _, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{PhoneNumberID: "pid", AccessToken: "tok", GraphAPIVersion: bad}); err == nil {
 			t.Errorf("GraphAPIVersion %q was accepted", bad)
 		}
+	}
+}
+
+// sentTemplate sends msg through a real Meta sender pointed at a local
+// server and returns the request's "template" object, after checking the
+// envelope around it.
+func sentTemplate(t *testing.T, msg WhatsAppMessage) any {
+	t.Helper()
+	var raw []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ = io.ReadAll(r.Body)
+		_, _ = w.Write([]byte(`{"messages":[{"id":"wamid.1"}]}`))
+	}))
+	defer server.Close()
+	sender, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{PhoneNumberID: "pid", AccessToken: "tok"})
+	if err != nil {
+		t.Fatalf("NewMetaCloudWhatsAppDispatcher: %v", err)
+	}
+	sender.(*metaCloudDispatcher).client.(*metaCloudAPIClient).baseURL = server.URL
+	if _, err := sender.Send(context.Background(), msg); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	var request struct {
+		MessagingProduct string `json:"messaging_product"`
+		To               string `json:"to"`
+		Type             string `json:"type"`
+		Template         any    `json:"template"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatalf("the request isn't JSON: %v: %s", err, raw)
+	}
+	if request.MessagingProduct != "whatsapp" || request.To != msg.To || request.Type != "template" {
+		t.Fatalf("the envelope = %s", raw)
+	}
+	return request.Template
+}
+
+// TestMetaCloudDispatcher_Send_Components: every value kind reaches Meta in
+// the exact shape Meta's send API takes (its template components,
+// authentication and coupon template pages, read 2026-10-24): typed
+// parameters, a named template's parameter_name, a button's sub_type and
+// string index, and a one-time code twice.
+func TestMetaCloudDispatcher_Send_Components(t *testing.T) {
+	otpBody, otpButtons := WhatsAppOTP("123456")
+	imageByID := WhatsAppParameter{Media: &WhatsAppMedia{Kind: WhatsAppMediaImage, ID: "1234"}}
+	video := WhatsAppVideo("https://example.com/v.mp4")
+	document := WhatsAppDocument("https://example.com/invoice.pdf", "invoice.pdf")
+	cases := []struct {
+		name string
+		msg  WhatsAppMessage
+		want string
+	}{
+		{"nothing to fill", WhatsAppMessage{TemplateName: "hello_world"},
+			`{"name":"hello_world","language":{"code":"en_US"}}`},
+		{"positional: a text header, every body kind, every button kind", WhatsAppMessage{
+			TemplateName: "order_update",
+			Header:       &WhatsAppParameter{Text: "Order 42"},
+			Body: []WhatsAppParameter{
+				WhatsAppText("Ada"),
+				{Currency: &WhatsAppCurrency{FallbackValue: "$100.99", Code: "USD", Amount1000: 100990}},
+				{DateTime: &WhatsAppDateTime{FallbackValue: "Feb 25, 1977"}},
+			},
+			Buttons: []WhatsAppButton{
+				{Index: 0, Kind: WhatsAppButtonURL, Value: "track/42"},
+				{Index: 1, Kind: WhatsAppButtonQuickReply, Value: "stop-promos"},
+				{Index: 2, Kind: WhatsAppButtonCopyCode, Value: "SAVE20"},
+			},
+		}, `{"name":"order_update","language":{"code":"en_US"},"components":[
+			{"type":"header","parameters":[{"type":"text","text":"Order 42"}]},
+			{"type":"body","parameters":[
+				{"type":"text","text":"Ada"},
+				{"type":"currency","currency":{"fallback_value":"$100.99","code":"USD","amount_1000":100990}},
+				{"type":"date_time","date_time":{"fallback_value":"Feb 25, 1977"}}]},
+			{"type":"button","sub_type":"url","index":"0","parameters":[{"type":"text","text":"track/42"}]},
+			{"type":"button","sub_type":"quick_reply","index":"1","parameters":[{"type":"payload","payload":"stop-promos"}]},
+			{"type":"button","sub_type":"copy_code","index":"2","parameters":[{"type":"coupon_code","coupon_code":"SAVE20"}]}]}`},
+		{"named", WhatsAppMessage{
+			TemplateName: "named",
+			Header:       &WhatsAppParameter{Name: "order_id", Text: "42"},
+			Body: []WhatsAppParameter{
+				WhatsAppNamedText("first_name", "Ada"),
+				{Name: "total", Currency: &WhatsAppCurrency{FallbackValue: "$1", Code: "EUR", Amount1000: 1000}},
+			},
+			Buttons: []WhatsAppButton{{Index: 0, Kind: WhatsAppButtonURL, Value: "Gon%C3%A7alves", Name: "customer_name"}},
+		}, `{"name":"named","language":{"code":"en_US"},"components":[
+			{"type":"header","parameters":[{"type":"text","parameter_name":"order_id","text":"42"}]},
+			{"type":"body","parameters":[
+				{"type":"text","parameter_name":"first_name","text":"Ada"},
+				{"type":"currency","parameter_name":"total","currency":{"fallback_value":"$1","code":"EUR","amount_1000":1000}}]},
+			{"type":"button","sub_type":"url","index":"0","parameters":[{"type":"text","parameter_name":"customer_name","text":"Gon%C3%A7alves"}]}]}`},
+		{"a one-time code", WhatsAppMessage{TemplateName: "login_code", Body: otpBody, Buttons: otpButtons},
+			`{"name":"login_code","language":{"code":"en_US"},"components":[
+			{"type":"body","parameters":[{"type":"text","text":"123456"}]},
+			{"type":"button","sub_type":"url","index":"0","parameters":[{"type":"text","text":"123456"}]}]}`},
+		{"an image by ID", WhatsAppMessage{TemplateName: "m", Header: &imageByID},
+			`{"name":"m","language":{"code":"en_US"},"components":[{"type":"header","parameters":[{"type":"image","image":{"id":"1234"}}]}]}`},
+		{"a video by link", WhatsAppMessage{TemplateName: "m", Header: &video},
+			`{"name":"m","language":{"code":"en_US"},"components":[{"type":"header","parameters":[{"type":"video","video":{"link":"https://example.com/v.mp4"}}]}]}`},
+		{"a document with its name", WhatsAppMessage{TemplateName: "m", Header: &document},
+			`{"name":"m","language":{"code":"en_US"},"components":[{"type":"header","parameters":[
+			{"type":"document","document":{"link":"https://example.com/invoice.pdf","filename":"invoice.pdf"}}]}]}`},
+		{"a location", WhatsAppMessage{TemplateName: "m", Header: &WhatsAppParameter{Location: &WhatsAppLocation{
+			Latitude: 37.44211676562361, Longitude: -122.16155960083124, Name: "Philz Coffee", Address: "101 Forest Ave, Palo Alto, CA 94301",
+		}}}, `{"name":"m","language":{"code":"en_US"},"components":[{"type":"header","parameters":[{"type":"location","location":{
+			"latitude":"37.44211676562361","longitude":"-122.16155960083124","name":"Philz Coffee","address":"101 Forest Ave, Palo Alto, CA 94301"}}]}]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.msg.To, tc.msg.LanguageCode = "+15551234567", "en_US"
+			got := sentTemplate(t, tc.msg)
+			var want any
+			if err := json.Unmarshal([]byte(tc.want), &want); err != nil {
+				t.Fatalf("the expected JSON: %v", err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				gotJSON, _ := json.Marshal(got)
+				wantJSON, _ := json.Marshal(want)
+				t.Fatalf("sent  %s\nwant %s", gotJSON, wantJSON)
+			}
+		})
 	}
 }

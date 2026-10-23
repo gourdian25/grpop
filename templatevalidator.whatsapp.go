@@ -69,19 +69,19 @@ func NewMetaTemplateValidator(deps MetaTemplateValidatorDeps) (TemplateValidator
 	}, nil
 }
 
-func (v *metaTemplateValidator) Validate(ctx context.Context, templateName, languageCode string, variables map[string]string) error {
+func (v *metaTemplateValidator) Validate(ctx context.Context, msg WhatsAppMessage) error {
 	if err := v.ensureFresh(ctx); err != nil {
 		return err
 	}
 
 	v.mu.RLock()
-	info, ok := v.templates[templateKey(templateName, languageCode)]
+	info, ok := v.templates[templateKey(msg.TemplateName, msg.LanguageCode)]
 	v.mu.RUnlock()
 
 	if !ok {
 		return ErrWhatsAppTemplateNotApproved
 	}
-	if len(variables) != info.ParameterCount {
+	if len(msg.Body) != info.ParameterCount {
 		return ErrWhatsAppTemplateArityMismatch
 	}
 	return nil

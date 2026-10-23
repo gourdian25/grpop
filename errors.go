@@ -75,9 +75,20 @@ var (
 	ErrWhatsAppTemplateNotApproved = permanent(errors.New("grpop: whatsapp template is not approved"))
 
 	// ErrWhatsAppTemplateArityMismatch indicates TemplateValidator.Validate
-	// found an approved template matching name+language, but
-	// len(TemplateVariables) does not match its expected parameter count.
+	// found an approved template matching name+language, but the message's
+	// Body values don't match its expected parameter count.
 	ErrWhatsAppTemplateArityMismatch = permanent(errors.New("grpop: whatsapp template variable count does not match the approved template's expected parameter count"))
+
+	// ErrInvalidPhoneNumber indicates a WhatsAppMessage.To that isn't a
+	// phone number in international form: an optional "+", a country code
+	// that doesn't start with 0, 7 to 15 digits in all, nothing else. The
+	// error never repeats the number.
+	ErrInvalidPhoneNumber = permanent(errors.New("grpop: invalid whatsapp phone number"))
+
+	// ErrWhatsAppParameterInvalid indicates a WhatsAppMessage Header, Body
+	// or Buttons value Meta would refuse (validateWhatsAppMessage has the
+	// list). The error names the field ("Body[1]"), never the value.
+	ErrWhatsAppParameterInvalid = permanent(errors.New("grpop: invalid whatsapp template parameter"))
 
 	// ErrRateLimited indicates a sender's RateLimiter or
 	// RecipientRateLimiter refused the send. Temporary: the send was not

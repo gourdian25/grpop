@@ -71,6 +71,18 @@
 // read from its error reference on 2026-10-23; a code Meta adds later is
 // classed by its HTTP status.
 //
+// A sender's circuit breaker counts only temporary failures. A permanent
+// one is about the message, not the vendor's health, and the vendor did
+// answer, so the breaker records it as a success: a run of bad addresses
+// never opens the breaker on the good messages behind them.
+//
+// A WhatsApp message's checks (validateWhatsAppMessage: the number's form,
+// and each Header, Body and Buttons value against Meta's send-time rules,
+// read 2026-10-24) refuse what Meta's documentation says it refuses. They
+// are not a promise Meta will accept the rest: an unknown template or a
+// wrong count of values is still Meta's refusal, and so is a rule Meta adds
+// later.
+//
 // There is no message broker or queue anywhere in this package. Every Send
 // dispatches directly and synchronously to the vendor on the caller's own
 // goroutine, and a rate-limited send fails at once (ErrRateLimited) rather

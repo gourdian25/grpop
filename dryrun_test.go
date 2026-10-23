@@ -58,12 +58,14 @@ func TestEmailContentDescription(t *testing.T) {
 	}
 }
 
+// TestDryRunWhatsAppSender_Send: the dry run logs the template and how many
+// values it fills, never a value (a one-time code is one) or the number.
 func TestDryRunWhatsAppSender_Send(t *testing.T) {
-	sender := NewDryRunWhatsAppSender(nil)
-	result, err := sender.Send(context.Background(), WhatsAppMessage{
-		To: "15551234567", TemplateName: "order_confirmation", LanguageCode: "en_US",
-		TemplateVariables: map[string]string{"1": "should-not-leak"},
-	})
+	logger := &argsLogger{}
+	sender := NewDryRunWhatsAppSender(logger)
+	msg := WhatsAppMessage{To: "15551234567", TemplateName: "login_code", LanguageCode: "en_US"}
+	msg.Body, msg.Buttons = WhatsAppOTP("should-not-leak")
+	result, err := sender.Send(context.Background(), msg)
 	if err != nil {
 		t.Fatalf("Send: %v", err)
 	}
@@ -75,6 +77,15 @@ func TestDryRunWhatsAppSender_Send(t *testing.T) {
 	}
 	if result.Channel != ChannelWhatsApp {
 		t.Fatalf("Channel = %v, want ChannelWhatsApp", result.Channel)
+	}
+	logged := logger.all()
+	if strings.Contains(logged, "should-not-leak") || strings.Contains(logged, "1555123") {
+		t.Fatalf("the dry run logged a value or the number: %s", logged)
+	}
+	for _, want := range []string{"templatelogin_code", "body_values1", "buttons1", "***4567"} {
+		if !strings.Contains(logged, want) {
+			t.Fatalf("the dry run's log %q lacks %q", logged, want)
+		}
 	}
 }
 

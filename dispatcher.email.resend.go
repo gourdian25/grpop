@@ -192,12 +192,7 @@ func (d *resendDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResu
 		id, callErr = d.post(ctx, body, email.idempotencyKey)
 		return callErr
 	}
-	var sendErr error
-	if d.circuitBreaker != nil {
-		sendErr = d.circuitBreaker.Execute(ctx, sendFn)
-	} else {
-		sendErr = sendFn()
-	}
+	sendErr := executeThroughBreaker(ctx, d.circuitBreaker, sendFn)
 
 	if d.metrics != nil {
 		d.metrics.ObserveSendLatency(ChannelEmail, time.Since(start))

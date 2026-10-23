@@ -91,8 +91,8 @@ type EmailTemplateEngine interface {
 }
 
 // TemplateValidator confirms a WhatsApp template name+language is
-// currently approved on Meta's side AND that the supplied variables'
-// count matches the approved template's expected parameter count —
+// currently approved on Meta's side AND that the message's Body values
+// match the approved template's expected parameter count —
 // catching the two most common vendor-rejection causes before a live send
 // is attempted. Backed by Meta's own template-listing endpoint, with a
 // short internal TTL cache (templates change rarely, so this is not
@@ -106,12 +106,12 @@ type EmailTemplateEngine interface {
 // passed Validate check never causes a dispatcher to skip actually
 // calling Meta.
 type TemplateValidator interface {
-	// Validate returns nil if templateName+languageCode is approved and
-	// len(variables) matches its expected parameter count;
+	// Validate returns nil if msg's TemplateName+LanguageCode is approved
+	// and len(msg.Body) matches its expected parameter count;
 	// ErrWhatsAppTemplateNotApproved if not approved;
-	// ErrWhatsAppTemplateArityMismatch if approved but the variable count
-	// doesn't match.
-	Validate(ctx context.Context, templateName, languageCode string, variables map[string]string) error
+	// ErrWhatsAppTemplateArityMismatch if approved but the count doesn't
+	// match.
+	Validate(ctx context.Context, msg WhatsAppMessage) error
 
 	// Refresh forces an immediate re-fetch of the approved-template list,
 	// bypassing the internal cache — e.g. call this right after

@@ -228,14 +228,19 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 		MessageID: messageID,
 	})
 
-	sendFn := func() error { return d.transact(ctx, fromAddr.Address, toAddr.Address, raw) }
-
-	var sendErr error
-	if d.circuitBreaker != nil {
-		sendErr = d.circuitBreaker.Execute(ctx, sendFn)
-	} else {
-		sendErr = sendFn()
+	sendFn := func() error {
+		err := d.transact(ctx, fromAddr.Address, toAddr.Address, raw)
+		// An SMTP 5xx reply is final for this message: a mailbox that
+		// doesn't exist, a sender the relay refuses, bad credentials.
+		// A 4xx reply, a dial or TLS failure, a timeout and an open
+		// breaker are worth another attempt. Classed here, inside the
+		// breaker, so a 5xx doesn't count against the relay.
+		if code := smtpResponseCode(err); code >= 500 && code < 600 {
+			return permanent(err)
+		}
+		return err
 	}
+	sendErr := executeThroughBreaker(ctx, d.circuitBreaker, sendFn)
 
 	if d.metrics != nil {
 		d.metrics.ObserveSendLatency(ChannelEmail, time.Since(start))
@@ -245,13 +250,6 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 	}
 
 	if sendErr != nil {
-		// An SMTP 5xx reply is final for this message: a mailbox that
-		// doesn't exist, a sender the relay refuses, bad credentials.
-		// A 4xx reply, a dial or TLS failure, a timeout and an open
-		// breaker are worth another attempt.
-		if code := smtpResponseCode(sendErr); code >= 500 && code < 600 {
-			sendErr = permanent(sendErr)
-		}
 		d.logger.Error("grpop/smtp: send failed", "to", maskEmail(toAddr.Address),
 			"error", redactAddresses(sendErr.Error(), toAddr.Address, fromAddr.Address))
 		if d.metrics != nil {

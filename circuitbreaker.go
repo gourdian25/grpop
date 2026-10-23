@@ -92,6 +92,34 @@ func NewCircuitBreakerWithConfig(config CircuitBreakerConfig) (CircuitBreaker, e
 	}, nil
 }
 
+// executeThroughBreaker runs send through cb (straight, when cb is nil) so
+// the breaker counts only a temporary failure against the vendor. A
+// permanent one (ErrPermanent: a mailbox that doesn't exist, a template
+// Meta refuses) is about the message, not the vendor's health, and the
+// vendor did answer, so cb records the call as a success and the error
+// comes back unchanged. Counted as failures, a run of bad addresses would
+// open the breaker and hold back every good message behind them. Every
+// sender calls the vendor through this, with send returning the classified
+// error.
+func executeThroughBreaker(ctx context.Context, cb CircuitBreaker, send func() error) error {
+	if cb == nil {
+		return send()
+	}
+	var permanentErr error
+	err := cb.Execute(ctx, func() error {
+		sendErr := send()
+		if errors.Is(sendErr, ErrPermanent) {
+			permanentErr = sendErr
+			return nil
+		}
+		return sendErr
+	})
+	if permanentErr != nil {
+		return permanentErr
+	}
+	return err
+}
+
 func (cb *standardCircuitBreaker) Execute(ctx context.Context, fn func() error) error {
 	if err := ctx.Err(); err != nil {
 		return err

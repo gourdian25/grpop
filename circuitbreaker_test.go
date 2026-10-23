@@ -5,6 +5,7 @@ package grpop
 import (
 	"context"
 	"errors"
+	"net/textproto"
 	"sync"
 	"testing"
 	"time"
@@ -260,4 +261,119 @@ func TestCircuitBreaker_TooManyRequestsWhileHalfOpen(t *testing.T) {
 
 	close(release)
 	<-done
+}
+
+// TestExecuteThroughBreaker: a permanent failure comes back unchanged and
+// doesn't count against the vendor (the breaker records the answer as a
+// success); a temporary one counts, and enough of them open the breaker.
+func TestExecuteThroughBreaker(t *testing.T) {
+	refused := permanent(errors.New("mailbox unknown"))
+	if err := executeThroughBreaker(context.Background(), nil, func() error { return refused }); err != refused {
+		t.Fatalf("with no breaker = %v, want the send's own error", err)
+	}
+
+	cb, err := NewCircuitBreaker(2, time.Hour, time.Hour)
+	if err != nil {
+		t.Fatalf("NewCircuitBreaker: %v", err)
+	}
+	calls := 0
+	for i := 0; i < 10; i++ {
+		if err := executeThroughBreaker(context.Background(), cb, func() error { calls++; return refused }); err != refused {
+			t.Fatalf("permanent failure %d = %v, want it unchanged", i, err)
+		}
+	}
+	if stats := cb.GetStats(); stats.State != CircuitStateClosed || stats.TotalFailures != 0 || stats.ConsecutiveFailures != 0 {
+		t.Fatalf("after ten permanent failures: %+v, want closed with no failures counted", stats)
+	}
+
+	down := errors.New("connection refused")
+	for i := 0; i < 2; i++ {
+		if err := executeThroughBreaker(context.Background(), cb, func() error { calls++; return down }); err != down {
+			t.Fatalf("temporary failure %d = %v, want it unchanged", i, err)
+		}
+	}
+	if cb.State() != CircuitStateOpen {
+		t.Fatalf("after two temporary failures the breaker is %s, want open", cb.State())
+	}
+	if err := executeThroughBreaker(context.Background(), cb, func() error { calls++; return nil }); !errors.Is(err, ErrCircuitOpen) {
+		t.Fatalf("with the breaker open = %v, want ErrCircuitOpen", err)
+	}
+	if calls != 12 {
+		t.Fatalf("send ran %d times, want 12 (not while open)", calls)
+	}
+}
+
+// TestSenders_BreakerCountsOnlyTemporaryFailures: each sender's vendor
+// refusals (SMTP 550, Resend 422, a Meta refusal) leave a one-failure
+// breaker closed, so the next message still goes; a temporary failure
+// opens it.
+func TestSenders_BreakerCountsOnlyTemporaryFailures(t *testing.T) {
+	ctx := context.Background()
+	email := EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b"}
+	cases := []struct {
+		name string
+		// build returns a send the vendor refuses, a send that fails
+		// temporarily, and how many calls reached the vendor, all through cb.
+		build func(t *testing.T, cb CircuitBreaker) (refused, temporary func() error, vendorCalls func() int)
+	}{
+		{"smtp", func(t *testing.T, cb CircuitBreaker) (func() error, func() error, func() int) {
+			refusing, refusingDialer := newTestSMTPDispatcher(t, &fakeSMTPClient{rcptErr: &textproto.Error{Code: 550, Msg: "no such user"}},
+				func(d *SMTPDispatcherDeps) { d.CircuitBreaker = cb })
+			failing, failingDialer := newTestSMTPDispatcher(t, &fakeSMTPClient{rcptErr: &textproto.Error{Code: 451, Msg: "try later"}},
+				func(d *SMTPDispatcherDeps) { d.CircuitBreaker = cb })
+			return func() error { _, err := refusing.Send(ctx, email); return err },
+				func() error { _, err := failing.Send(ctx, email); return err },
+				func() int { return refusingDialer.calls() + failingDialer.calls() }
+		}},
+		{"resend", func(t *testing.T, cb CircuitBreaker) (func() error, func() error, func() int) {
+			refusingAPI := &fakeResend{status: 422, body: `{"name":"validation_error","message":"Invalid to"}`}
+			failingAPI := &fakeResend{status: 500, body: `{"name":"application_error","message":"Oops"}`}
+			refusing := newTestResendDispatcher(t, refusingAPI, func(d *ResendDispatcherDeps) { d.CircuitBreaker = cb })
+			failing := newTestResendDispatcher(t, failingAPI, func(d *ResendDispatcherDeps) { d.CircuitBreaker = cb })
+			return func() error { _, err := refusing.Send(ctx, email); return err },
+				func() error { _, err := failing.Send(ctx, email); return err },
+				func() int { return len(refusingAPI.received()) + len(failingAPI.received()) }
+		}},
+		{"whatsapp", func(t *testing.T, cb CircuitBreaker) (func() error, func() error, func() int) {
+			refusingAPI := &fakeWhatsAppCloudAPIClient{sendErr: permanent(errors.New("(#132001) template does not exist"))}
+			failingAPI := &fakeWhatsAppCloudAPIClient{sendErr: errors.New("(#131000) something went wrong")}
+			refusing, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{Client: refusingAPI, CircuitBreaker: cb})
+			if err != nil {
+				t.Fatalf("NewMetaCloudWhatsAppDispatcher: %v", err)
+			}
+			failing, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{Client: failingAPI, CircuitBreaker: cb})
+			if err != nil {
+				t.Fatalf("NewMetaCloudWhatsAppDispatcher: %v", err)
+			}
+			return func() error { _, err := refusing.Send(ctx, validWhatsAppMessage()); return err },
+				func() error { _, err := failing.Send(ctx, validWhatsAppMessage()); return err },
+				func() int { return refusingAPI.calls() + failingAPI.calls() }
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cb, err := NewCircuitBreaker(1, time.Hour, time.Hour)
+			if err != nil {
+				t.Fatalf("NewCircuitBreaker: %v", err)
+			}
+			refused, temporary, vendorCalls := tc.build(t, cb)
+			for i := 0; i < 10; i++ {
+				if err := refused(); !errors.Is(err, ErrPermanent) {
+					t.Fatalf("refusal %d = %v, want a permanent failure", i, err)
+				}
+			}
+			if cb.State() != CircuitStateClosed || vendorCalls() != 10 {
+				t.Fatalf("after ten refusals: breaker %s, %d vendor calls; want closed and 10", cb.State(), vendorCalls())
+			}
+			if err := temporary(); err == nil || errors.Is(err, ErrPermanent) {
+				t.Fatalf("the temporary failure = %v", err)
+			}
+			if err := refused(); !errors.Is(err, ErrCircuitOpen) {
+				t.Fatalf("after a temporary failure = %v, want ErrCircuitOpen", err)
+			}
+			if vendorCalls() != 11 {
+				t.Fatalf("%d vendor calls, want 11 (none while open)", vendorCalls())
+			}
+		})
+	}
 }

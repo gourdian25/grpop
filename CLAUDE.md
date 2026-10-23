@@ -30,9 +30,9 @@ message-broker client or a storage driver: a vendor is a hand-rolled
 purpose (`docs/plan/grpop-plan.md`).
 
 The live plan is `docs/plan/2026-10-23-grpop-delivery-only.md` (P1 remove,
-P2 fix, P3 shared email preparation, P4 a Resend sender, P5 release `v0.2.0`,
-P6 WhatsApp completed after grsentry's M1): one stage per "next", the user
-commits. Design references: `docs/architecture.md` (the why behind every
+P2 fix, P3 shared email preparation, P4 a Resend sender, P5 WhatsApp
+messages, P6 the template validator, then grsentry's M1 on the untagged
+grpop, P7 release `v0.2.0` last): one stage per "next", the user commits. Design references: `docs/architecture.md` (the why behind every
 decision below), `docs.go` (godoc only; its "Precise, non-aspirational claims"
 section is the contract the README's Limitations list is drawn from, so keep
 the two in sync), and `docs/plan/grpop-plan.md` (the original 16-stage plan,
@@ -95,7 +95,20 @@ against a fake `WhatsAppCloudAPIClient`, and the real HTTP client against an
   answers a refusal with `ErrRateLimited` at once, never waiting; a limiter
   error stops the send (fail closed).
 - **Circuit breaking and template rendering live on the senders** (their
-  `Deps`), gating or shaping every individual `Send`.
+  `Deps`), gating or shaping every individual `Send`. Every sender calls its
+  vendor through `executeThroughBreaker` (`circuitbreaker.go`) with a send
+  function that returns the already-classified error, so the breaker counts
+  only temporary failures; a permanent one is recorded as the vendor
+  answering. Classify inside the send function, never after the breaker.
+- **A WhatsApp message is typed values** (`types.go`): `Header`
+  (text/media/location), `Body` (text/currency/date-time, positional or
+  named, never mixed) and `Buttons` (URL, quick reply, coupon, one-time
+  code; `WhatsAppOTP` builds the code's body-and-button pair).
+  `validateWhatsAppMessage` refuses what Meta's send-time rules refuse
+  (`ErrInvalidPhoneNumber`, `ErrWhatsAppParameterInvalid`); the real client
+  builds Meta's `components` (`metaTemplateComponents`), whose exact JSON
+  the `httptest` tests pin. `WhatsAppCloudAPIRequest` is a conversion of
+  `WhatsAppMessage`, so the two keep the same fields.
 
 **Vendors:**
 

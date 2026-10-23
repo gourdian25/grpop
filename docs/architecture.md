@@ -97,6 +97,16 @@ rendering on `SMTPDispatcherDeps.TemplateEngine`, since content-mode
 resolution (`TemplateName`/`InlineTemplate`/literal) has to happen
 immediately before the MIME message is built.
 
+Every sender calls its vendor through `executeThroughBreaker`, with the
+send function returning the already-classified error. That helper lets the
+breaker count only a temporary failure. A permanent one is about the
+message (a mailbox that doesn't exist, a template Meta refuses), and the
+vendor did answer, so the breaker records it as a success and the error
+comes back unchanged (decided 2026-10-24). Counted as failures, a run of
+bad addresses would open the breaker and hold back the good messages
+behind them. This is why the SMTP sender classes a `5xx` inside the send
+function, not after the breaker.
+
 ### 3.3 A failure is the returned error, and says whether to retry
 
 `Send` returns `(SendResult{Status: SendStatusFailed}, err)` for a failed
@@ -175,11 +185,29 @@ real local `httptest.Server` (not Meta itself, but a real HTTP round trip). Ever
 `v26.0`; Meta retires a version about two years after release, and the
 earlier hard-coded `v20.0` stopped on 2026-09-24).
 
+A `WhatsAppMessage` fills its template with typed values (since 0.2.0,
+replacing `TemplateVariables map[string]string`, which carried only
+positional body text and silently cut the list at a gap in its keys):
+
+- `Header`: text, image, video, document or location;
+- `Body`: text, currency or date and time, positional or named, never mixed;
+- `Buttons`: a URL suffix, a quick-reply payload, a coupon code or a
+  one-time code, each by its index.
+
+The real client turns them into Meta's `components`. A button carries its
+`sub_type` and a string `index`, and a one-time code goes as the `url`
+sub_type, sent twice (body and button 0) as Meta's copy-code and one-tap
+authentication templates require. `WhatsAppOTP` builds that pair.
+
+`validateWhatsAppMessage` refuses, before any call, what Meta's send-time
+rules refuse (read 2026-10-24). The tests pin the exact JSON of every kind
+against an `httptest` server.
+
 ### 3.8 `TemplateValidator`: advisory, TTL-cached, never a false negative
 
 Meta requires every WhatsApp template to go through approval before use;
 `TemplateValidator.Validate` checks both approval status and that
-`TemplateVariables`' count matches the approved template's expected
+`WhatsAppMessage.Body`'s length matches the approved template's expected
 parameter count (`WhatsAppTemplateInfo.ParameterCount`, parsed from the
 approved template body's `{{1}}`, `{{2}}`, ... placeholder count) —
 catching the two most common vendor-rejection causes before a live send is

@@ -46,12 +46,15 @@ var metaTemporaryErrorCodes = map[int]bool{
 
 // WhatsAppCloudAPIRequest is grpop's own vendor-neutral shape for one
 // WhatsApp template send, translated from a WhatsAppMessage by
-// metaCloudDispatcher before reaching WhatsAppCloudAPIClient.
+// metaCloudDispatcher (after validateWhatsAppMessage) before reaching
+// WhatsAppCloudAPIClient.
 type WhatsAppCloudAPIRequest struct {
-	To                string
-	TemplateName      string
-	LanguageCode      string
-	TemplateVariables map[string]string
+	To           string
+	TemplateName string
+	LanguageCode string
+	Header       *WhatsAppParameter
+	Body         []WhatsAppParameter
+	Buttons      []WhatsAppButton
 }
 
 // WhatsAppCloudAPIResponse is the vendor-neutral result of one successful
@@ -188,7 +191,7 @@ func (d *metaCloudDispatcher) Send(ctx context.Context, msg WhatsAppMessage) (Se
 	}
 
 	if d.templateValidator != nil {
-		if err := d.templateValidator.Validate(ctx, msg.TemplateName, msg.LanguageCode, msg.TemplateVariables); err != nil {
+		if err := d.templateValidator.Validate(ctx, msg); err != nil {
 			d.logger.Warn("grpop/metacloud: template validation failed", "template", msg.TemplateName, "error", err)
 			if d.metrics != nil {
 				d.metrics.IncSendResult(ChannelWhatsApp, SendStatusFailed)
@@ -201,12 +204,9 @@ func (d *metaCloudDispatcher) Send(ctx context.Context, msg WhatsAppMessage) (Se
 		return SendResult{}, err
 	}
 
-	req := WhatsAppCloudAPIRequest{
-		To:                msg.To,
-		TemplateName:      msg.TemplateName,
-		LanguageCode:      msg.LanguageCode,
-		TemplateVariables: msg.TemplateVariables,
-	}
+	// The same fields as WhatsAppMessage, so a conversion: a field added to
+	// one and not the other stops this compiling.
+	req := WhatsAppCloudAPIRequest(msg)
 
 	var resp WhatsAppCloudAPIResponse
 	sendFn := func() error {
@@ -214,13 +214,7 @@ func (d *metaCloudDispatcher) Send(ctx context.Context, msg WhatsAppMessage) (Se
 		resp, sendErr = d.client.SendTemplateMessage(ctx, req)
 		return sendErr
 	}
-
-	var err error
-	if d.circuitBreaker != nil {
-		err = d.circuitBreaker.Execute(ctx, sendFn)
-	} else {
-		err = sendFn()
-	}
+	err := executeThroughBreaker(ctx, d.circuitBreaker, sendFn)
 
 	if d.metrics != nil {
 		d.metrics.ObserveSendLatency(ChannelWhatsApp, time.Since(start))
@@ -288,13 +282,53 @@ type metaLanguage struct {
 	Code string `json:"code"`
 }
 
+// metaTemplateParameter is one value of a send's components, holding the
+// field its Type names.
 type metaTemplateParameter struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type          string        `json:"type"`
+	ParameterName string        `json:"parameter_name,omitempty"`
+	Text          string        `json:"text,omitempty"`
+	Currency      *metaCurrency `json:"currency,omitempty"`
+	DateTime      *metaDateTime `json:"date_time,omitempty"`
+	Image         *metaMedia    `json:"image,omitempty"`
+	Video         *metaMedia    `json:"video,omitempty"`
+	Document      *metaMedia    `json:"document,omitempty"`
+	Location      *metaLocation `json:"location,omitempty"`
+	Payload       string        `json:"payload,omitempty"`
+	CouponCode    string        `json:"coupon_code,omitempty"`
 }
 
+type metaCurrency struct {
+	FallbackValue string `json:"fallback_value"`
+	Code          string `json:"code"`
+	Amount1000    int64  `json:"amount_1000"`
+}
+
+type metaDateTime struct {
+	FallbackValue string `json:"fallback_value"`
+}
+
+type metaMedia struct {
+	ID       string `json:"id,omitempty"`
+	Link     string `json:"link,omitempty"`
+	Filename string `json:"filename,omitempty"`
+}
+
+// metaLocation's coordinates are strings, as in Meta's own location header
+// example.
+type metaLocation struct {
+	Latitude  string `json:"latitude"`
+	Longitude string `json:"longitude"`
+	Name      string `json:"name,omitempty"`
+	Address   string `json:"address,omitempty"`
+}
+
+// metaTemplateComponent is a send's header, body or one button. A button
+// names its sub_type and its index, a string ("0").
 type metaTemplateComponent struct {
 	Type       string                  `json:"type"`
+	SubType    string                  `json:"sub_type,omitempty"`
+	Index      string                  `json:"index,omitempty"`
 	Parameters []metaTemplateParameter `json:"parameters"`
 }
 
@@ -332,12 +366,10 @@ func (c *metaCloudAPIClient) SendTemplateMessage(ctx context.Context, req WhatsA
 		To:               req.To,
 		Type:             "template",
 		Template: metaTemplatePayload{
-			Name:     req.TemplateName,
-			Language: metaLanguage{Code: req.LanguageCode},
+			Name:       req.TemplateName,
+			Language:   metaLanguage{Code: req.LanguageCode},
+			Components: metaTemplateComponents(req),
 		},
-	}
-	if params := positionalTemplateParameters(req.TemplateVariables); len(params) > 0 {
-		body.Template.Components = []metaTemplateComponent{{Type: "body", Parameters: params}}
 	}
 
 	url := fmt.Sprintf("%s/%s/%s/messages", c.baseURL, c.apiVersion, c.phoneNumberID)
@@ -356,21 +388,84 @@ func (c *metaCloudAPIClient) SendTemplateMessage(ctx context.Context, req WhatsA
 	return WhatsAppCloudAPIResponse{MessageID: parsed.Messages[0].ID}, nil
 }
 
-// positionalTemplateParameters converts req.TemplateVariables' stringified
-// positional keys ("1","2","3", ...) into Meta's ordered component
-// parameter list, stopping at the first missing key — Meta's template
-// parameters must be contiguous starting at "1", so a gap can't be
-// meaningfully represented as "skip this one."
-func positionalTemplateParameters(variables map[string]string) []metaTemplateParameter {
-	var params []metaTemplateParameter
-	for i := 1; ; i++ {
-		v, ok := variables[strconv.Itoa(i)]
-		if !ok {
-			break
-		}
-		params = append(params, metaTemplateParameter{Type: "text", Text: v})
+// metaTemplateComponents is req's header, body and buttons as Meta's send
+// takes them: a header component with its one value, a body component with
+// its values in order, and one button component per button. A template
+// with nothing to fill has no components (nil, left out of the JSON).
+func metaTemplateComponents(req WhatsAppCloudAPIRequest) []metaTemplateComponent {
+	var components []metaTemplateComponent
+	if req.Header != nil {
+		components = append(components, metaTemplateComponent{
+			Type: "header", Parameters: []metaTemplateParameter{metaParameter(*req.Header)},
+		})
 	}
-	return params
+	if len(req.Body) > 0 {
+		params := make([]metaTemplateParameter, 0, len(req.Body))
+		for _, p := range req.Body {
+			params = append(params, metaParameter(p))
+		}
+		components = append(components, metaTemplateComponent{Type: "body", Parameters: params})
+	}
+	for _, b := range req.Buttons {
+		components = append(components, metaButton(b))
+	}
+	return components
+}
+
+// metaParameter is p as Meta's typed parameter; p holds one value
+// (validateWhatsAppMessage), and a text value is the fallthrough.
+func metaParameter(p WhatsAppParameter) metaTemplateParameter {
+	param := metaTemplateParameter{ParameterName: p.Name}
+	switch {
+	case p.Currency != nil:
+		param.Type = "currency"
+		param.Currency = &metaCurrency{FallbackValue: p.Currency.FallbackValue, Code: p.Currency.Code, Amount1000: p.Currency.Amount1000}
+	case p.DateTime != nil:
+		param.Type = "date_time"
+		param.DateTime = &metaDateTime{FallbackValue: p.DateTime.FallbackValue}
+	case p.Media != nil:
+		media := &metaMedia{ID: p.Media.ID, Link: p.Media.Link, Filename: p.Media.Filename}
+		param.Type = string(p.Media.Kind)
+		switch p.Media.Kind {
+		case WhatsAppMediaImage:
+			param.Image = media
+		case WhatsAppMediaVideo:
+			param.Video = media
+		default:
+			param.Document = media
+		}
+	case p.Location != nil:
+		param.Type = "location"
+		param.Location = &metaLocation{
+			Latitude:  strconv.FormatFloat(p.Location.Latitude, 'f', -1, 64),
+			Longitude: strconv.FormatFloat(p.Location.Longitude, 'f', -1, 64),
+			Name:      p.Location.Name,
+			Address:   p.Location.Address,
+		}
+	default:
+		param.Type = "text"
+		param.Text = p.Text
+	}
+	return param
+}
+
+// metaButton is b as a button component. A one-time code goes as Meta's
+// "url" sub_type, as a URL suffix does: that is how Meta's copy-code and
+// one-tap authentication templates take it.
+func metaButton(b WhatsAppButton) metaTemplateComponent {
+	component := metaTemplateComponent{Type: "button", Index: strconv.Itoa(b.Index)}
+	switch b.Kind {
+	case WhatsAppButtonQuickReply:
+		component.SubType = "quick_reply"
+		component.Parameters = []metaTemplateParameter{{Type: "payload", Payload: b.Value}}
+	case WhatsAppButtonCopyCode:
+		component.SubType = "copy_code"
+		component.Parameters = []metaTemplateParameter{{Type: "coupon_code", CouponCode: b.Value}}
+	default:
+		component.SubType = "url"
+		component.Parameters = []metaTemplateParameter{{Type: "text", ParameterName: b.Name, Text: b.Value}}
+	}
+	return component
 }
 
 type metaTemplateListResponse struct {

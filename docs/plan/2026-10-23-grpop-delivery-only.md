@@ -12,8 +12,8 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 | P2 | Fix what is left: one permanent-vs-temporary error check callers use, safe addresses, masked emails in logs, the Meta API version as config | **Done** 2026-10-23 |
 | P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | **Done** 2026-10-23 |
 | P4 | The Resend sender over `net/http` (no SDK) | **Done** 2026-10-24 |
-| P5 | WhatsApp messages: typed components (header, body, buttons; named or positional), the OTP helper, phone and value checks, and the breaker counting only temporary failures | **Next** |
-| P6 | The template validator, usable and truthful: an exported Meta client, paginated listing, component-aware counts, advisory when the listing fails; a live Meta smoke test | To do |
+| P5 | WhatsApp messages: typed components (header, body, buttons; named or positional), the OTP helper, phone and value checks, and the breaker counting only temporary failures | **Done** 2026-10-24 |
+| P6 | The template validator, usable and truthful: an exported Meta client, paginated listing, component-aware counts, advisory when the listing fails; a live Meta smoke test | **Next** |
 | *grsentry* | M1a–M1d on this untagged grpop: `../go.work` in workspace mode, a pseudo-version of a pushed `master` commit for `GOWORK=off` and CI. A change M1 needs here becomes a stage of its own | To do |
 | P7 | Release `v0.2.0` once grsentry runs on it and grpop needs nothing more: the CHANGELOG dated, `make prerelease`, the user tags; grsentry moves from the pseudo-version to the tag | To do, last |
 
@@ -168,7 +168,47 @@ Meta's reference, read 2026-10-24, confirms:
 
 Meta's docs have moved (`developers.facebook.com/documentation/business-messaging/whatsapp/`), and the pages read did not show the body, text-header and media-header parameter shapes or the quick-reply and coupon-code ones. P5 starts by confirming them, and the live test (P6) proves the payload against Meta.
 
-## P5: WhatsApp messages (next)
+## P5: WhatsApp messages (done)
+
+**Built 2026-10-24.** Meta's limits were re-read first:
+- its template components page: a header of 60 characters, a body of 1024, at most 10 buttons, 2 of them URL;
+- its copy-code authentication page: a code of at most 15 characters, sent twice;
+- its coupon template page: a coupon of at most 20 characters;
+- its template overview: named parameters in lower case with underscores.
+
+Five departures from the plan below, each stricter or forced by what Meta takes:
+- **A fourth button kind, `WhatsAppButtonOTP`.** The OTP length check needs to know which button holds a code; a URL suffix has no 15-character limit. Meta still gets the `url` sub_type. An OTP button's code must also be the body's one value, Meta's "appears twice".
+- **Phone numbers of 7 to 15 digits, not 8.** Niue's and Tokelau's shortest numbers have 7. The first digit after the optional `+` is never 0, which would be a national number missing its country code.
+- **The text rule covers every text value, not only the body's.** That is the header, a currency's or date's fallback, and a button's value: no line break, no tab, no five spaces in a row (Meta's error 132018 is about any parameter value; four spaces pass).
+- **A few more refusals:**
+  - media must name exactly one of `ID` or `Link`;
+  - a `Filename` is for documents only;
+  - a location must fall within latitude −90 to 90 and longitude −180 to 180;
+  - a currency code is three upper-case letters;
+  - a parameter name never repeats.
+
+  A URL button may carry a `Name` for a named template, after Meta's own example with `parameter_name` on the URL button.
+- **The breaker records a permanent failure as a success, not as uncounted.** `CircuitBreaker` has no "don't count" outcome, and a permanent refusal is the vendor answering. This is `executeThroughBreaker`. The SMTP sender's `5xx` classification moved inside it; before, it came after the breaker had already counted the reply.
+
+`TemplateValidator.Validate` now takes the message (`Validate(ctx, msg)`) and compares `len(msg.Body)`; P6 makes it component-aware. `WhatsAppCloudAPIRequest` is a conversion of `WhatsAppMessage` (the linter's S1016), so the two keep the same fields.
+
+**Checked:**
+- the gate: gofmt, build and vet both ways, `GOWORK=off go mod tidy -diff`, `bark check`;
+- `make precommit`: lint 0 issues, `-race`, coverage 97.5%, with a throwaway Mailpit removed with `docker rm -f -v`; the one skip was the live Resend test;
+- mutants, on copies, each built first, with a control that passes: 10 of 10 caught:
+  - the OTP button dropped;
+  - the index sent as a number;
+  - a line break allowed;
+  - the phone check skipped;
+  - the breaker counting a permanent failure;
+  - named and positional values mixed;
+  - four spaces refused;
+  - a 16-character OTP allowed;
+  - media with both an ID and a Link;
+  - an SMTP `5xx` left temporary.
+
+The plan as written before the stage:
+
 
 - **`types.go`:** `WhatsAppMessage` keeps `To`, `TemplateName`, `LanguageCode` and replaces `TemplateVariables` with:
   - `Header *WhatsAppParameter`: a text, image, video, document or location value, one per template;
@@ -206,7 +246,7 @@ Meta's docs have moved (`developers.facebook.com/documentation/business-messagin
   - a permanent failure counted by the breaker;
   - named and positional values mixed.
 
-## P6: the template validator, usable and truthful
+## P6: the template validator, usable and truthful (next)
 
 - **An exported client:** `NewMetaCloudAPIClient(MetaCloudAPIClientConfig{PhoneNumberID, BusinessAccountID, AccessToken, GraphAPIVersion, Timeout})`. The dispatcher uses it when `Client` is nil, and a caller hands the same client to `NewMetaTemplateValidator`.
 - **The listing:**

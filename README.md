@@ -112,6 +112,36 @@ sender, err := grpop.NewResendDispatcher(grpop.ResendDispatcherDeps{
 })
 ```
 
+A WhatsApp message names a Meta-approved template and fills its
+placeholders with typed values: `Header` (text, image, video, document or
+location), `Body` (text, currency or date and time, positional or named) and
+`Buttons` (a URL suffix, a quick-reply payload, a coupon code or a one-time
+code). An authentication template's code goes in twice, which
+`WhatsAppOTP` does:
+
+```go
+sender, err := grpop.NewMetaCloudWhatsAppDispatcher(grpop.MetaCloudDispatcherDeps{
+    PhoneNumberID: os.Getenv("META_PHONE_NUMBER_ID"),
+    AccessToken:   os.Getenv("META_ACCESS_TOKEN"),
+})
+
+msg := grpop.WhatsAppMessage{To: "+15551234567", TemplateName: "login_code", LanguageCode: "en_US"}
+msg.Body, msg.Buttons = grpop.WhatsAppOTP(code)
+result, err := sender.Send(ctx, msg)
+
+// a positional template: {{1}} and {{2}}, in order
+order := grpop.WhatsAppMessage{To: "+15551234567", TemplateName: "order_shipped", LanguageCode: "en_US",
+    Body:    []grpop.WhatsAppParameter{grpop.WhatsAppText("Ada"), grpop.WhatsAppText("#42")},
+    Buttons: []grpop.WhatsAppButton{{Index: 0, Kind: grpop.WhatsAppButtonURL, Value: "track/42"}},
+}
+```
+
+Before calling Meta, the sender refuses a number that isn't in international
+form (`ErrInvalidPhoneNumber`) and any value Meta's send-time rules refuse
+(`ErrWhatsAppParameterInvalid`, naming the field). Examples: a line break, a
+tab or five spaces in a row in a value; a header over 60 characters; a
+one-time code over 15; named and positional values mixed.
+
 See [example/main.go](example/main.go) and
 [example/templates_auth.go](example/templates_auth.go) for a complete,
 runnable walkthrough covering all four use cases this design is grounded
@@ -139,6 +169,12 @@ sender, err := grpop.NewSMTPDispatcher(grpop.SMTPDispatcherDeps{
     CircuitBreaker:       breaker,
 })
 ```
+
+The breaker counts only temporary failures (a timeout, a `4xx` reply, a
+vendor `5xx`). A permanent one (`ErrPermanent`: a mailbox that doesn't exist,
+a template Meta refuses) concerns that message, not the vendor's health, and
+the vendor did answer, so the breaker records it as a success. A run of bad
+addresses never opens the breaker on the good messages behind them.
 
 `RateLimiter` is `Allow(ctx context.Context, key string) (bool, error)`,
 exactly grsentry's `pkg/grlimiter.Limiter`, so its local or Redis limiter
@@ -201,7 +237,8 @@ fail the same way on every attempt matches it, and nothing else does.
   `ErrEmailFromRequired`, `ErrEmailTemplateEngineRequired`,
   `ErrInvalidAddress`, `ErrWhatsAppTemplateNameRequired`,
   `ErrWhatsAppLanguageCodeRequired`, `ErrWhatsAppTemplateNotApproved`,
-  `ErrWhatsAppTemplateArityMismatch`), a template that won't render, an SMTP
+  `ErrWhatsAppTemplateArityMismatch`, `ErrInvalidPhoneNumber`,
+  `ErrWhatsAppParameterInvalid`), a template that won't render, an SMTP
   `5xx` reply (a mailbox that doesn't exist, a refused sender, bad
   credentials), and a Meta refusal of the request, the account or the
   template.
@@ -250,6 +287,11 @@ names the field, never the value. Display names are fine
   has no room to represent, so send once per recipient instead.
 - **WhatsApp has no local test emulator.** The Meta Cloud API client is
   tested against a fake `WhatsAppCloudAPIClient` and an `httptest` server.
+- **A WhatsApp message's checks are Meta's documented send-time rules (read
+  2026-10-24), not a promise Meta will accept it.** Meta stays the
+  authority: a message that passes can still be refused (an unknown
+  template, a wrong count of values), and a rule Meta adds later is only
+  Meta's refusal until grpop learns it.
 - **grpop never refreshes or rotates a Meta access token.** Token lifecycle
   is entirely the operator's responsibility.
 - **Meta retires a Graph API version about two years after release.**

@@ -24,7 +24,7 @@ func TestMetaTemplateValidator_Validate_ApprovedAndArityMatches(t *testing.T) {
 		t.Fatalf("NewMetaTemplateValidator: %v", err)
 	}
 
-	err = validator.Validate(context.Background(), "order_confirmation", "en_US", map[string]string{"1": "a", "2": "b"})
+	err = validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "order_confirmation", LanguageCode: "en_US", Body: []WhatsAppParameter{WhatsAppText("a"), WhatsAppText("b")}})
 	if err != nil {
 		t.Fatalf("Validate: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestMetaTemplateValidator_Validate_NotApproved(t *testing.T) {
 		t.Fatalf("NewMetaTemplateValidator: %v", err)
 	}
 
-	err = validator.Validate(context.Background(), "order_confirmation", "en_US", nil)
+	err = validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "order_confirmation", LanguageCode: "en_US"})
 	if !errors.Is(err, ErrWhatsAppTemplateNotApproved) {
 		t.Fatalf("Validate() err = %v, want ErrWhatsAppTemplateNotApproved", err)
 	}
@@ -54,7 +54,7 @@ func TestMetaTemplateValidator_Validate_WrongLanguageIsNotApproved(t *testing.T)
 		t.Fatalf("NewMetaTemplateValidator: %v", err)
 	}
 
-	err = validator.Validate(context.Background(), "order_confirmation", "en_US", map[string]string{"1": "a"})
+	err = validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "order_confirmation", LanguageCode: "en_US", Body: []WhatsAppParameter{WhatsAppText("a")}})
 	if !errors.Is(err, ErrWhatsAppTemplateNotApproved) {
 		t.Fatalf("Validate() err = %v, want ErrWhatsAppTemplateNotApproved (approval is per-language)", err)
 	}
@@ -69,7 +69,7 @@ func TestMetaTemplateValidator_Validate_ArityMismatch(t *testing.T) {
 		t.Fatalf("NewMetaTemplateValidator: %v", err)
 	}
 
-	err = validator.Validate(context.Background(), "order_confirmation", "en_US", map[string]string{"1": "only-one"})
+	err = validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "order_confirmation", LanguageCode: "en_US", Body: []WhatsAppParameter{WhatsAppText("only-one")}})
 	if !errors.Is(err, ErrWhatsAppTemplateArityMismatch) {
 		t.Fatalf("Validate() err = %v, want ErrWhatsAppTemplateArityMismatch", err)
 	}
@@ -85,7 +85,7 @@ func TestMetaTemplateValidator_Validate_FetchesOnceThenCaches(t *testing.T) {
 	}
 
 	for i := 0; i < 3; i++ {
-		if err := validator.Validate(context.Background(), "t", "en_US", nil); err != nil {
+		if err := validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"}); err != nil {
 			t.Fatalf("Validate() call %d: %v", i, err)
 		}
 	}
@@ -95,7 +95,7 @@ func TestMetaTemplateValidator_Validate_FetchesOnceThenCaches(t *testing.T) {
 	// validator does not observe the change until TTL elapses or Refresh is
 	// called explicitly.
 	client.templates = nil
-	if err := validator.Validate(context.Background(), "t", "en_US", nil); err != nil {
+	if err := validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"}); err != nil {
 		t.Fatalf("Validate() after backing list changed (should still be cache-fresh): %v", err)
 	}
 }
@@ -109,14 +109,14 @@ func TestMetaTemplateValidator_Validate_RefetchesAfterTTLExpires(t *testing.T) {
 		t.Fatalf("NewMetaTemplateValidator: %v", err)
 	}
 
-	if err := validator.Validate(context.Background(), "t", "en_US", nil); err != nil {
+	if err := validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"}); err != nil {
 		t.Fatalf("first Validate: %v", err)
 	}
 
 	client.templates = nil // template no longer approved as of the next fetch
 	time.Sleep(20 * time.Millisecond)
 
-	err = validator.Validate(context.Background(), "t", "en_US", nil)
+	err = validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"})
 	if !errors.Is(err, ErrWhatsAppTemplateNotApproved) {
 		t.Fatalf("Validate() after TTL expiry err = %v, want ErrWhatsAppTemplateNotApproved", err)
 	}
@@ -129,7 +129,7 @@ func TestMetaTemplateValidator_Refresh_ForcesImmediateRefetch(t *testing.T) {
 		t.Fatalf("NewMetaTemplateValidator: %v", err)
 	}
 
-	if err := validator.Validate(context.Background(), "t", "en_US", nil); !errors.Is(err, ErrWhatsAppTemplateNotApproved) {
+	if err := validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"}); !errors.Is(err, ErrWhatsAppTemplateNotApproved) {
 		t.Fatalf("Validate() before approval err = %v, want ErrWhatsAppTemplateNotApproved", err)
 	}
 
@@ -138,7 +138,7 @@ func TestMetaTemplateValidator_Refresh_ForcesImmediateRefetch(t *testing.T) {
 		t.Fatalf("Refresh: %v", err)
 	}
 
-	if err := validator.Validate(context.Background(), "t", "en_US", nil); err != nil {
+	if err := validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"}); err != nil {
 		t.Fatalf("Validate() after Refresh: %v", err)
 	}
 }
@@ -153,7 +153,7 @@ func TestMetaTemplateValidator_Refresh_PropagatesClientError(t *testing.T) {
 	if err := validator.Refresh(context.Background()); err == nil {
 		t.Fatal("Refresh() err = nil, want non-nil")
 	}
-	if err := validator.Validate(context.Background(), "t", "en_US", nil); err == nil {
+	if err := validator.Validate(context.Background(), WhatsAppMessage{TemplateName: "t", LanguageCode: "en_US"}); err == nil {
 		t.Fatal("Validate() err = nil, want non-nil (underlying fetch failed)")
 	}
 }
