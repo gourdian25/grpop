@@ -28,6 +28,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -106,10 +107,13 @@ func main() {
 	fmt.Println("\nDone — check http://localhost:8025 (Mailpit's web UI) if using the default local target.")
 }
 
-// sendWithRetry sends msg once and, on a failure, tries again a few times,
-// spaced by grpop.FullJitterBackoff, giving up at expiresAt (the link the
-// message carries is dead by then). A real caller keeps the message durably
-// between attempts so a crash doesn't lose it; this demo only loops.
+// sendWithRetry sends msg once and, on a temporary failure, tries again a
+// few times, spaced by grpop.FullJitterBackoff, giving up at expiresAt (the
+// link the message carries is dead by then). A failure matching
+// grpop.ErrPermanent (a bad address, a mailbox that doesn't exist, a
+// template that won't render) stops at once: it would fail the same way
+// every time. A real caller keeps the message durably between attempts so a
+// crash doesn't lose it; this demo only loops.
 func sendWithRetry(ctx context.Context, sender grpop.EmailSender, label string, msg grpop.EmailMessage, expiresAt time.Time) {
 	const maxAttempts = 3
 	for attempt := 0; ; attempt++ {
@@ -119,7 +123,7 @@ func sendWithRetry(ctx context.Context, sender grpop.EmailSender, label string, 
 			return
 		}
 		wait := grpop.FullJitterBackoff(200*time.Millisecond, 2*time.Second, attempt)
-		if attempt+1 >= maxAttempts || time.Now().Add(wait).After(expiresAt) {
+		if errors.Is(err, grpop.ErrPermanent) || attempt+1 >= maxAttempts || time.Now().Add(wait).After(expiresAt) {
 			log.Fatalf("[%s] send failed after %d attempt(s): %v", label, attempt+1, err)
 		}
 		time.Sleep(wait)

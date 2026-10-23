@@ -12,6 +12,10 @@ with an outbox; see `docs/plan/2026-10-23-grpop-delivery-only.md`). An
 earlier draft of this version, never tagged, moved the Mongo dead-letter
 backend to `mongo-driver/v2`; that backend is now removed.
 
+### Added
+
+- `ErrPermanent`, `ErrInvalidAddress`, `MetaCloudDispatcherDeps.GraphAPIVersion`.
+
 ### Removed
 
 - `Service`, `NewService`, `ServiceDeps`, `ServiceConfig`,
@@ -40,6 +44,21 @@ backend to `mongo-driver/v2`; that backend is now removed.
   `ErrRateLimited` at once instead of waiting for a token; a limiter error
   stops the send. `Metrics.IncRateLimitRejected` now counts refusals.
 - `make docker-up`/`docker-down` start and stop Mailpit only.
+- **`ErrPermanent`:** every failure that will recur on every attempt
+  matches it (the validation sentinels, a template that won't render, an
+  SMTP `5xx` reply, a Meta refusal outside its retry-later codes, `429` and
+  `5xx`); everything else is temporary. Before, an SMTP `550` looked like a
+  network blip.
+- **Addresses:** `From`, `To` and `Reply-To` are parsed with `net/mail`; an
+  unparseable one or one carrying a CR or LF is `ErrInvalidAddress` (a
+  `Reply-To` with a line break used to add a header, such as a `Bcc`).
+  Display names are supported; `MAIL FROM`/`RCPT TO` take the bare address.
+  An invalid `SMTPDispatcherDeps.DefaultFrom` fails at construction.
+- **Logs:** the SMTP and dry-run senders log a recipient masked
+  (`a***@example.com`), also inside an SMTP reply that echoes it.
+- **Meta Graph API version:** `MetaCloudDispatcherDeps.GraphAPIVersion`,
+  default `v26.0`. The hard-coded `v20.0` stopped being served on
+  2026-09-24.
 - `example/` sends through the SMTP sender with a caller-side retry loop on
   `FullJitterBackoff`.
 

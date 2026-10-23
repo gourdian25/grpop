@@ -96,7 +96,10 @@ against a fake `WhatsAppCloudAPIClient`, and the real HTTP client against an
   timeout, which may still deliver. This is documented and deliberate.
   `SMTPDialer.Dial` performs STARTTLS itself. Plain-text auth over
   `SMTPTLSInsecureNoTLS` requires `AllowInsecureAuth`.
-- **Meta:** sends use `PhoneNumberID`, while template listing for
+- **Meta:** every call names `GraphAPIVersion` (default
+  `defaultMetaGraphAPIVersion`, `v26.0`; Meta retires a version about two
+  years after release, so bump the default before it does). Sends use
+  `PhoneNumberID`, while template listing for
   `TemplateValidator` needs the separate `BusinessAccountID`.
   `TemplateValidator`'s TTL cache is advisory. It can let a since-revoked
   template through, but it never blocks a send Meta would accept, and a passing
@@ -113,6 +116,17 @@ against a fake `WhatsAppCloudAPIClient`, and the real HTTP client against an
   condition its own sentinel rather than reusing one. Match with `errors.Is`;
   there is no `IsX` helper. A vendor's own error (a Graph API envelope, an
   SMTP reply) is wrapped with context before it leaves a sender.
+- **`ErrPermanent` is the retry contract.** A new validation sentinel is
+  built with `permanent(errors.New(...))` so it matches `ErrPermanent`; a
+  sender wraps a vendor's final refusal with `permanent(err)` (SMTP `5xx`;
+  Meta refusals outside `metaTemporaryErrorCodes`, a `429` and `5xx`).
+  Anything worth another attempt stays plain. Getting this wrong either
+  retries a hopeless send or drops a deliverable one.
+- **Addresses and logs:** every email address goes through
+  `parseEmailAddress` (net/mail, line breaks refused) before it reaches a
+  header or the envelope; a log line carries `maskEmail`'s form (or
+  `maskPhoneNumber`'s), never a full address or number, and never a
+  rendered body.
 - **Logger:** the ecosystem-wide slog-shaped interface (`Debug/Info/Warn/Error(msg,
   args ...any)`), so `*slog.Logger` satisfies it. Constructors pass a nil logger
   through `OrNop`. New log lines take a flat `"grpop: "` prefix plus a

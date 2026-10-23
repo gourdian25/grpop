@@ -141,9 +141,9 @@ var _ EmailSender = (*smtpDispatcher)(nil)
 //
 // Returns:
 //   - EmailSender
-//   - error: non-nil if deps.Addr is empty/unparseable, or if deps.Auth is
+//   - error: non-nil if deps.Addr is empty/unparseable, if deps.Auth is
 //     set alongside TLSMode == SMTPTLSInsecureNoTLS without
-//     AllowInsecureAuth
+//     AllowInsecureAuth, or if deps.DefaultFrom is set but isn't an address
 func NewSMTPDispatcher(deps SMTPDispatcherDeps) (EmailSender, error) {
 	if deps.Addr == "" {
 		return nil, errors.New("grpop/smtp: SMTPDispatcherDeps.Addr is required")
@@ -157,6 +157,11 @@ func NewSMTPDispatcher(deps SMTPDispatcherDeps) (EmailSender, error) {
 	}
 	if deps.TLSMode == SMTPTLSInsecureNoTLS && deps.Auth != nil && !deps.AllowInsecureAuth {
 		return nil, errors.New("grpop/smtp: Auth is set with TLSMode=insecure_no_tls (credentials over plaintext); set AllowInsecureAuth to confirm this is intentional")
+	}
+	if deps.DefaultFrom != "" {
+		if _, err := parseEmailAddress("DefaultFrom", deps.DefaultFrom); err != nil {
+			return nil, fmt.Errorf("grpop/smtp: %w", err)
+		}
 	}
 	if deps.ConnectTimeout <= 0 {
 		deps.ConnectTimeout = 5 * time.Second
@@ -210,23 +215,41 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 	if from == "" {
 		return SendResult{}, ErrEmailFromRequired
 	}
+	fromAddr, err := parseEmailAddress("From", from)
+	if err != nil {
+		return SendResult{}, err
+	}
+	toAddr, err := parseEmailAddress("To", msg.To)
+	if err != nil {
+		return SendResult{}, err
+	}
+	replyTo := ""
+	if msg.ReplyTo != "" {
+		replyToAddr, err := parseEmailAddress("ReplyTo", msg.ReplyTo)
+		if err != nil {
+			return SendResult{}, err
+		}
+		replyTo = replyToAddr.String()
+	}
 
-	if err := checkRateLimits(ctx, ChannelEmail, msg.To, d.rateLimiter, d.recipientLimit, d.metrics); err != nil {
+	if err := checkRateLimits(ctx, ChannelEmail, toAddr.Address, d.rateLimiter, d.recipientLimit, d.metrics); err != nil {
 		return SendResult{}, err
 	}
 
-	messageID := fmt.Sprintf("%s@%s", generateMemoryID(), messageIDDomain(from))
+	// The headers carry the parsed addresses (a display name Q-encoded);
+	// MAIL FROM and RCPT TO the bare ones.
+	messageID := fmt.Sprintf("%s@%s", generateMemoryID(), messageIDDomain(fromAddr.Address))
 	raw := buildMIMEMessage(mimeMessageInput{
-		From:      from,
-		To:        msg.To,
-		ReplyTo:   msg.ReplyTo,
+		From:      fromAddr.String(),
+		To:        toAddr.String(),
+		ReplyTo:   replyTo,
 		Subject:   subject,
 		HTMLBody:  htmlBody,
 		TextBody:  textBody,
 		MessageID: messageID,
 	})
 
-	sendFn := func() error { return d.transact(ctx, from, msg.To, raw) }
+	sendFn := func() error { return d.transact(ctx, fromAddr.Address, toAddr.Address, raw) }
 
 	var sendErr error
 	if d.circuitBreaker != nil {
@@ -243,14 +266,22 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 	}
 
 	if sendErr != nil {
-		d.logger.Error("grpop/smtp: send failed", "to", msg.To, "error", sendErr)
+		// An SMTP 5xx reply is final for this message: a mailbox that
+		// doesn't exist, a sender the relay refuses, bad credentials.
+		// A 4xx reply, a dial or TLS failure, a timeout and an open
+		// breaker are worth another attempt.
+		if code := smtpResponseCode(sendErr); code >= 500 && code < 600 {
+			sendErr = permanent(sendErr)
+		}
+		d.logger.Error("grpop/smtp: send failed", "to", maskEmail(toAddr.Address),
+			"error", redactAddresses(sendErr.Error(), toAddr.Address, fromAddr.Address))
 		if d.metrics != nil {
 			d.metrics.IncSendResult(ChannelEmail, SendStatusFailed)
 		}
 		return SendResult{Channel: ChannelEmail, Status: SendStatusFailed, SentAt: time.Now().UTC()}, sendErr
 	}
 
-	d.logger.Info("grpop/smtp: sent", "to", msg.To, "message_id", messageID)
+	d.logger.Info("grpop/smtp: sent", "to", maskEmail(toAddr.Address), "message_id", messageID)
 	if d.metrics != nil {
 		d.metrics.IncSendResult(ChannelEmail, SendStatusSent)
 	}

@@ -6,9 +6,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/smtp"
 	"net/textproto"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -534,5 +536,171 @@ func TestRealSMTPDialer_DialError(t *testing.T) {
 	dialer := &realSMTPDialer{serverName: "localhost", tlsMode: SMTPTLSInsecureNoTLS, connectTimeout: 200 * time.Millisecond}
 	if _, err := dialer.Dial("localhost:1"); err == nil {
 		t.Fatal("Dial(unreachable) err = nil, want non-nil")
+	}
+}
+
+// argsLogger records every log line with its key/values flattened into one
+// string, so a test can look for an address anywhere in what was logged.
+type argsLogger struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (l *argsLogger) log(msg string, args ...any) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.lines = append(l.lines, fmt.Sprint(append([]any{msg}, args...)...))
+}
+func (l *argsLogger) Debug(msg string, args ...any) { l.log(msg, args...) }
+func (l *argsLogger) Info(msg string, args ...any)  { l.log(msg, args...) }
+func (l *argsLogger) Warn(msg string, args ...any)  { l.log(msg, args...) }
+func (l *argsLogger) Error(msg string, args ...any) { l.log(msg, args...) }
+
+func (l *argsLogger) all() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.lines, "\n")
+}
+
+// TestSMTPDispatcher_Send_ClassifiesFailures: a 5xx reply is permanent
+// (a missing mailbox, a refused sender, bad credentials); a 4xx reply, a dial
+// failure and a write failure are not.
+func TestSMTPDispatcher_Send_ClassifiesFailures(t *testing.T) {
+	cases := []struct {
+		name      string
+		client    *fakeSMTPClient
+		auth      bool
+		permanent bool
+	}{
+		{"550 at RCPT", &fakeSMTPClient{rcptErr: &textproto.Error{Code: 550, Msg: "no such user"}}, false, true},
+		{"553 at MAIL", &fakeSMTPClient{mailErr: &textproto.Error{Code: 553, Msg: "sender refused"}}, false, true},
+		{"535 at AUTH", &fakeSMTPClient{authErr: &textproto.Error{Code: 535, Msg: "bad credentials"}}, true, true},
+		{"421 at RCPT", &fakeSMTPClient{rcptErr: &textproto.Error{Code: 421, Msg: "try later"}}, false, false},
+		{"450 at RCPT", &fakeSMTPClient{rcptErr: &textproto.Error{Code: 450, Msg: "mailbox busy"}}, false, false},
+		{"a write failure", &fakeSMTPClient{writeErr: errors.New("connection reset")}, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sender, _ := newTestSMTPDispatcher(t, tc.client, func(d *SMTPDispatcherDeps) {
+				if tc.auth {
+					d.Auth = smtp.PlainAuth("", "u", "p", "localhost")
+					d.AllowInsecureAuth = true
+				}
+			})
+			_, err := sender.Send(context.Background(), EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b"})
+			if err == nil {
+				t.Fatal("Send() err = nil, want a failure")
+			}
+			if got := errors.Is(err, ErrPermanent); got != tc.permanent {
+				t.Fatalf("errors.Is(%v, ErrPermanent) = %v, want %v", err, got, tc.permanent)
+			}
+		})
+	}
+
+	dialer := &fakeSMTPDialer{err: errors.New("connection refused")}
+	sender, err := NewSMTPDispatcher(SMTPDispatcherDeps{Addr: "localhost:1025", DefaultFrom: "s@example.com", TLSMode: SMTPTLSInsecureNoTLS, Dialer: dialer})
+	if err != nil {
+		t.Fatalf("NewSMTPDispatcher: %v", err)
+	}
+	if _, err := sender.Send(context.Background(), EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b"}); err == nil || errors.Is(err, ErrPermanent) {
+		t.Fatalf("a dial failure = %v, want a temporary failure", err)
+	}
+}
+
+// TestSMTPDispatcher_Send_RefusesBadAddresses: a line break in Reply-To, To
+// or From, or an address net/mail refuses, is ErrInvalidAddress before
+// anything is dialled, and the error never repeats the value.
+func TestSMTPDispatcher_Send_RefusesBadAddresses(t *testing.T) {
+	cases := []struct {
+		name string
+		msg  EmailMessage
+	}{
+		{"Reply-To with a Bcc line", EmailMessage{To: "a@b.com", ReplyTo: "r@b.com\r\nBcc: spy@evil.test", Subject: "s", TextBody: "b"}},
+		{"To with a Bcc line", EmailMessage{To: "a@b.com\r\nBcc: spy@evil.test", Subject: "s", TextBody: "b"}},
+		{"From with a Bcc line", EmailMessage{To: "a@b.com", From: "f@b.com\nBcc: spy@evil.test", Subject: "s", TextBody: "b"}},
+		{"an unparseable To", EmailMessage{To: "spy-at-evil.test", Subject: "s", TextBody: "b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &fakeSMTPClient{}
+			sender, dialer := newTestSMTPDispatcher(t, client, nil)
+			_, err := sender.Send(context.Background(), tc.msg)
+			if !errors.Is(err, ErrInvalidAddress) || !errors.Is(err, ErrPermanent) {
+				t.Fatalf("Send() err = %v, want ErrInvalidAddress", err)
+			}
+			if strings.Contains(err.Error(), "evil.test") {
+				t.Fatalf("the error repeats the value: %q", err)
+			}
+			if dialer.calls() != 0 || len(client.dataWritten) != 0 {
+				t.Fatal("a bad address reached the relay")
+			}
+		})
+	}
+}
+
+// TestNewSMTPDispatcher_RejectsInvalidDefaultFrom: a DefaultFrom that isn't
+// an address fails at construction, not on the first send.
+func TestNewSMTPDispatcher_RejectsInvalidDefaultFrom(t *testing.T) {
+	_, err := NewSMTPDispatcher(SMTPDispatcherDeps{Addr: "localhost:1025", DefaultFrom: "no-reply\r\nBcc: spy@evil.test", TLSMode: SMTPTLSInsecureNoTLS})
+	if !errors.Is(err, ErrInvalidAddress) {
+		t.Fatalf("NewSMTPDispatcher(bad DefaultFrom) = %v, want ErrInvalidAddress", err)
+	}
+}
+
+// TestSMTPDispatcher_Send_DisplayNames: MAIL FROM and RCPT TO take the bare
+// addresses, the headers the parsed ones, the Message-ID the sender's domain,
+// and the recipient's rate-limit bucket is the same with or without a name.
+func TestSMTPDispatcher_Send_DisplayNames(t *testing.T) {
+	client := &fakeSMTPClient{}
+	limiter := &fakeRateLimiter{}
+	sender, _ := newTestSMTPDispatcher(t, client, func(d *SMTPDispatcherDeps) { d.RecipientRateLimiter = limiter })
+	_, err := sender.Send(context.Background(), EmailMessage{
+		To: "Ada Lovelace <Ada@Example.com>", From: "Acme <no-reply@acme.test>", ReplyTo: "Support <help@acme.test>",
+		Subject: "s", TextBody: "b",
+	})
+	if err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	if client.mailFrom != "no-reply@acme.test" || client.rcptTo != "Ada@Example.com" {
+		t.Fatalf("MAIL FROM %q, RCPT TO %q, want the bare addresses", client.mailFrom, client.rcptTo)
+	}
+	raw := string(client.dataWritten)
+	for _, header := range []string{
+		"From: \"Acme\" <no-reply@acme.test>\r\n",
+		"To: \"Ada Lovelace\" <Ada@Example.com>\r\n",
+		"Reply-To: \"Support\" <help@acme.test>\r\n",
+	} {
+		if !strings.Contains(raw, header) {
+			t.Errorf("message lacks %q:\n%s", header, raw)
+		}
+	}
+	if !regexp.MustCompile(`\r\nMessage-ID: <[0-9a-f]+@acme\.test>\r\n`).MatchString(raw) {
+		t.Errorf("Message-ID doesn't carry the sender's bare domain:\n%s", raw)
+	}
+	if got := limiter.asked(); len(got) != 1 || got[0] != recipientRateLimitKey(ChannelEmail, "ada@example.com") {
+		t.Fatalf("recipient key %v, want the bare address's", got)
+	}
+}
+
+// TestSMTPDispatcher_LogsMaskedAddresses: no log line carries a full
+// address, even when the relay's reply echoes it.
+func TestSMTPDispatcher_LogsMaskedAddresses(t *testing.T) {
+	logger := &argsLogger{}
+	client := &fakeSMTPClient{}
+	sender, _ := newTestSMTPDispatcher(t, client, func(d *SMTPDispatcherDeps) { d.Logger = logger })
+	if _, err := sender.Send(context.Background(), EmailMessage{To: "ada@example.com", Subject: "s", TextBody: "b"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	failing := &fakeSMTPClient{rcptErr: &textproto.Error{Code: 550, Msg: "5.1.1 <ada@example.com>: unknown user; sender sender@example.com"}}
+	sender, _ = newTestSMTPDispatcher(t, failing, func(d *SMTPDispatcherDeps) { d.Logger = logger })
+	if _, err := sender.Send(context.Background(), EmailMessage{To: "ada@example.com", Subject: "s", TextBody: "b"}); err == nil {
+		t.Fatal("Send() err = nil, want the 550")
+	}
+	logged := logger.all()
+	if strings.Contains(logged, "ada@example.com") || strings.Contains(logged, "sender@example.com") {
+		t.Fatalf("a log line carries a full address:\n%s", logged)
+	}
+	if !strings.Contains(logged, "a***@example.com") {
+		t.Fatalf("the logs don't name the masked recipient:\n%s", logged)
 	}
 }

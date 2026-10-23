@@ -58,10 +58,23 @@
 // stopped, and may still deliver. A caller that must not double-send needs
 // a vendor-side idempotency key.
 //
+// ErrPermanent separates a failure that will recur on every attempt (a
+// malformed or unrenderable message, an unparseable address, an SMTP 5xx
+// reply, a Meta refusal of the request, account or template) from one worth
+// another attempt (a rate limit, an open breaker, an SMTP 4xx, a network
+// failure, a timeout, a Meta 429, 5xx or retry-later code). Meta's list was
+// read from its error reference on 2026-10-23; a code Meta adds later is
+// classed by its HTTP status.
+//
 // There is no message broker or queue anywhere in this package. Every Send
 // dispatches directly and synchronously to the vendor on the caller's own
 // goroutine, and a rate-limited send fails at once (ErrRateLimited) rather
 // than waiting.
+//
+// A WhatsApp sender names one Graph API version on every call
+// (MetaCloudDispatcherDeps.GraphAPIVersion, default v26.0). Meta retires
+// each version about two years after release, so the default needs a bump
+// before then (v20.0, the earlier hard-coded one, stopped on 2026-09-24).
 //
 // grpop never refreshes or rotates a WhatsApp dispatcher's Meta access
 // token. Token lifecycle — rotating a long-lived/System User token before

@@ -5,6 +5,7 @@ package grpop
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -26,6 +27,7 @@ func newTestMetaCloudAPIClient(baseURL string) *metaCloudAPIClient {
 		phoneNumberID:     "test-phone-id",
 		businessAccountID: "test-waba-id",
 		accessToken:       "test-token",
+		apiVersion:        defaultMetaGraphAPIVersion,
 		baseURL:           baseURL,
 	}
 }
@@ -182,5 +184,86 @@ func TestMetaCloudAPIClient_DoJSON_NonJSONErrorBody(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "status 500") {
 		t.Fatalf("err = %v, want it to mention the raw status code since the body wasn't Meta's JSON error envelope", err)
+	}
+}
+
+// TestMetaCloudAPIClient_ClassifiesRefusals: Meta's retry-later codes, a 429
+// and a 5xx are temporary; every other refusal is permanent (Meta's error
+// reference, read 2026-10-23).
+func TestMetaCloudAPIClient_ClassifiesRefusals(t *testing.T) {
+	cases := []struct {
+		name      string
+		status    int
+		body      string
+		permanent bool
+	}{
+		{"100 invalid parameter", 400, `{"error":{"message":"(#100) Invalid parameter","code":100}}`, true},
+		{"131026 undeliverable", 400, `{"error":{"message":"Message undeliverable","code":131026}}`, true},
+		{"132001 template does not exist", 404, `{"error":{"message":"Template name does not exist","code":132001}}`, true},
+		{"190 expired token", 401, `{"error":{"message":"Session has expired","code":190}}`, true},
+		{"a 404 with no envelope", 404, `not json`, true},
+		{"130429 throughput", 400, `{"error":{"message":"Rate limit hit","code":130429}}`, false},
+		{"131056 pair rate limit", 400, `{"error":{"message":"Pair rate limit","code":131056}}`, false},
+		{"4 app rate limit", 400, `{"error":{"message":"Application request limit reached","code":4}}`, false},
+		{"131000 unknown", 500, `{"error":{"message":"Something went wrong","code":131000}}`, false},
+		{"a 429 with no envelope", 429, ``, false},
+		{"a 503 with no envelope", 503, ``, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+			_, err := newTestMetaCloudAPIClient(server.URL).SendTemplateMessage(context.Background(), WhatsAppCloudAPIRequest{To: "+15551234567", TemplateName: "t", LanguageCode: "en_US"})
+			if err == nil {
+				t.Fatal("SendTemplateMessage() err = nil, want a refusal")
+			}
+			if got := errors.Is(err, ErrPermanent); got != tc.permanent {
+				t.Fatalf("errors.Is(%v, ErrPermanent) = %v, want %v", err, got, tc.permanent)
+			}
+		})
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := server.URL
+	server.Close()
+	_, err := newTestMetaCloudAPIClient(url).SendTemplateMessage(context.Background(), WhatsAppCloudAPIRequest{To: "+15551234567", TemplateName: "t", LanguageCode: "en_US"})
+	if err == nil || errors.Is(err, ErrPermanent) {
+		t.Fatalf("a network failure = %v, want a temporary failure", err)
+	}
+}
+
+// TestNewMetaCloudWhatsAppDispatcher_GraphAPIVersion: every call names the
+// configured version, the current default when none is set; a malformed one
+// fails at construction.
+func TestNewMetaCloudWhatsAppDispatcher_GraphAPIVersion(t *testing.T) {
+	for _, tc := range []struct{ configured, want string }{{"", defaultMetaGraphAPIVersion}, {"v27.0", "v27.0"}} {
+		var gotPath string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			_, _ = w.Write([]byte(`{"messages":[{"id":"wamid.1"}]}`))
+		}))
+		sender, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{PhoneNumberID: "pid", AccessToken: "tok", GraphAPIVersion: tc.configured})
+		if err != nil {
+			t.Fatalf("NewMetaCloudWhatsAppDispatcher(%q): %v", tc.configured, err)
+		}
+		sender.(*metaCloudDispatcher).client.(*metaCloudAPIClient).baseURL = server.URL
+		if _, err := sender.Send(context.Background(), validWhatsAppMessage()); err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		server.Close()
+		if gotPath != "/"+tc.want+"/pid/messages" {
+			t.Fatalf("GraphAPIVersion %q called %q, want /%s/pid/messages", tc.configured, gotPath, tc.want)
+		}
+	}
+	if defaultMetaGraphAPIVersion == "v20.0" {
+		t.Fatal("the default is v20.0, which Meta stopped serving on 2026-09-24")
+	}
+	for _, bad := range []string{"26.0", "v26", "latest", "v26.0/../x"} {
+		if _, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{PhoneNumberID: "pid", AccessToken: "tok", GraphAPIVersion: bad}); err == nil {
+			t.Errorf("GraphAPIVersion %q was accepted", bad)
+		}
 	}
 }

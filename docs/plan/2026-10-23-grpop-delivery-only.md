@@ -9,8 +9,8 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 | Stage | What | Status |
 |---|---|---|
 | P1 | Remove what isn't delivery: `Service`, the idempotency store, the DLQ (memory, Postgres, Mongo), `MessageEncryptor`, `Service`'s lifecycle events, and grpop's own rate limiters (`RateLimiter` becomes `grlimiter.Limiter`'s shape) | **Done** 2026-10-23 |
-| P2 | Fix what is left: one permanent-vs-temporary error check callers use, safe addresses, masked emails in logs, the Meta API version as config | **Next** |
-| P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | To do |
+| P2 | Fix what is left: one permanent-vs-temporary error check callers use, safe addresses, masked emails in logs, the Meta API version as config | **Done** 2026-10-23 |
+| P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | **Next** |
 | P4 | The Resend sender over `net/http` (no SDK) | To do |
 | P5 | Release `v0.2.0` | To do |
 | P6 | WhatsApp completion: header and media parameters, buttons (URL, copy-code), named parameters, Meta's current API version, a live smoke test | To do, after grsentry's M1 (M1 needs email only) |
@@ -76,7 +76,7 @@ grpop builds and vets against grcache `v0.6.0` (grsentry's), checked on a copy; 
 - **Live:** `go run ./example` against that Mailpit sent all four emails.
 - **Mutants:** 6 of 6 caught by unit tests, the control green: the channel asked before the recipient; a limiter error letting the send through; the raw address in the key; the rejection metric dropped; the SMTP sender skipping the check; the WhatsApp sender skipping the recipient limiter.
 
-## P2: fix what is left
+## P2: fix what is left (done)
 
 - **One permanent-error check.** A new sentinel `ErrPermanent`; every error a retry can never fix wraps it (`errors.Join`), so a caller asks `errors.Is(err, grpop.ErrPermanent)` and needs no list (grpop's convention: sentinels and `errors.Is`, no `IsX` helpers). It covers:
   - every validation sentinel (`ErrRecipientRequired`, `ErrNoContentModeSet`, `ErrMultipleContentModesSet`, `ErrEmailFromRequired`, `ErrEmailTemplateEngineRequired`, `ErrEmailTemplateNotFound`, `ErrInlineTemplateTooLarge`, the WhatsApp ones, and P2's `ErrInvalidAddress`);
@@ -88,6 +88,19 @@ grpop builds and vets against grcache `v0.6.0` (grsentry's), checked on a copy; 
 - **The Meta API version as config:** `MetaCloudDispatcherDeps.GraphAPIVersion`, defaulting to a current version (the hard-coded `v20.0`, May 2024, is at or past Meta's two-year window; checked when the stage starts).
 - **Tests:** the throwaway proofs become real tests: a `550` is permanent and a `421` isn't; a `Reply-To` with CR/LF is refused and no `Bcc` line is written; a log line carries the masked address; each Meta class.
 - **Mutants:** the 5xx rule dropped; the CR/LF check dropped; `ParseAddress` skipped on `ReplyTo`; the mask bypassed; a validation sentinel unwrapped from `ErrPermanent`.
+
+*P2 as built (2026-10-23):*
+- **`ErrPermanent`** (`errors.go`): `permanent(err)` wraps an error in `permanentError`, which keeps its message and chain and also matches `ErrPermanent`. All 11 validation sentinels and the new `ErrInvalidAddress` are built with it; so are template parse and render errors (the same data fails every time).
+- **SMTP:** a `5xx` reply (`*textproto.Error`) becomes permanent after the breaker; `4xx`, dial, TLS, write failures and timeouts stay temporary. The breaker still counts every failure, a permanent one included (documented; see the open point below).
+- **Meta:** `doJSON` classes a refusal temporary when its Graph code is one of `metaTemporaryErrorCodes` (2, 4, 80007, 130429, 131000, 131016, 131056, 133004, 2494100; Meta's error reference, read 2026-10-23), or the status is `429` or `5xx`; every other refusal is permanent. A network failure stays temporary.
+- **The Graph API version:** `MetaCloudDispatcherDeps.GraphAPIVersion`, validated as `vN.N`, default `v26.0` (released 2026-07-29, Meta's changelog read 2026-10-23). **The hard-coded `v20.0` had stopped being served on 2026-09-24**, a month before this stage.
+- **Addresses** (`parseEmailAddress`, `payloadvalidator.go`): `From`, `To`, `Reply-To` and `DefaultFrom` (at construction) go through `net/mail`, a CR or LF refused first. The error names the field and never the value: not even `net/mail`'s own message, which can quote the input back (found by mutant 2). Headers carry the parsed form, `MAIL FROM`/`RCPT TO` and the recipient's rate-limit key the bare address; the Message-ID takes the bare sender's domain (a display-name `From` used to give it `acme.test>`).
+- **Logs:** `maskEmail` (`a***@example.com`) on the SMTP and dry-run senders' lines, and `redactAddresses` masks an address an SMTP reply echoes.
+- **`example/`** stops retrying on `ErrPermanent`.
+- **Tests:** `errors_test.go` (new: every sentinel permanent, temporary errors not, `permanent` keeps the chain); SMTP: the failure classes, bad addresses refused before dialling, display names, a bad `DefaultFrom`, no full address in any log line; Meta: 11 refusal classes and a network failure, the version in the URL, malformed versions refused; the template engine's errors permanent; the dry run's masked log; `parseEmailAddress`, `maskEmail`, `redactAddresses`.
+- **Gate:** all green: gofmt, build and vet (both ways), `go mod tidy -diff`, `make precommit` (lint 0 issues, `-race`, coverage 97.1%) with a throwaway Mailpit (no skips; removed `-v`), `bark check` (`bark tree` for `errors_test.go`); `go run ./example` sent all four.
+- **Mutants:** 11 of 11 caught, the control green: the 5xx rule dropped; the line-break check dropped; `Reply-To` unparsed; the mask bypassed; a sentinel not permanent; 130429 classed permanent; the default back at `v20.0`; a render error not permanent; the SMTP reply logged unredacted; every Meta 4xx temporary; `net/mail`'s message echoed in the error.
+- **Open, for the user:** the circuit breaker counts a permanent failure like any other, so a burst of `550`s for bad addresses could open it for every recipient. Counting only temporary failures would be a one-line change in each sender; not done without a decision.
 
 ## P3: one email preparation step, and an idempotency key
 

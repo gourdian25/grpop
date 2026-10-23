@@ -10,15 +10,39 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const (
-	metaGraphAPIBaseURL = "https://graph.facebook.com"
-	metaGraphAPIVersion = "v20.0"
-)
+const metaGraphAPIBaseURL = "https://graph.facebook.com"
+
+// defaultMetaGraphAPIVersion is MetaCloudDispatcherDeps.GraphAPIVersion's
+// default: v26.0, the newest Graph API version (released 2026-07-29), read
+// from Meta's changelog on 2026-10-23. Meta keeps each version about two
+// years; v20.0, hard-coded here until then, stopped being available on
+// 2026-09-24. Bump it when Meta announces the next one's end date.
+const defaultMetaGraphAPIVersion = "v26.0"
+
+// metaGraphAPIVersionPattern is the shape of a Graph API version: "v",
+// major, ".", minor.
+var metaGraphAPIVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+$`)
+
+// metaTemporaryErrorCodes are the Graph API error codes Meta's WhatsApp
+// Cloud API error reference says to retry after a wait (read 2026-10-23):
+// 2 (temporary downtime or overload), 4 (the app's call rate limit), 80007
+// (the account's rate limit), 130429 (message throughput limit), 131000
+// (unknown error), 131016 (service temporarily unavailable), 131056 (too
+// many messages to one recipient), 133004 (server temporarily
+// unavailable), 2494100 (the number in maintenance mode). doJSON treats
+// these, a 429 and any 5xx as temporary, and every other refusal (bad
+// parameters, permissions, an expired token, an unknown or paused
+// template, an undeliverable number, policy) as permanent.
+var metaTemporaryErrorCodes = map[int]bool{
+	2: true, 4: true, 80007: true, 130429: true, 131000: true,
+	131016: true, 131056: true, 133004: true, 2494100: true,
+}
 
 // WhatsAppCloudAPIRequest is grpop's own vendor-neutral shape for one
 // WhatsApp template send, translated from a WhatsAppMessage by
@@ -76,6 +100,12 @@ type MetaCloudDispatcherDeps struct {
 	// to ctx's own deadline, whichever is sooner. Default: 10s.
 	RequestTimeout time.Duration
 
+	// GraphAPIVersion is the Graph API version every call names ("v26.0").
+	// Empty uses defaultMetaGraphAPIVersion. Meta retires a version about
+	// two years after release, so an operator can move ahead of grpop's
+	// default without a new grpop release.
+	GraphAPIVersion string
+
 	// Client is optional; nil constructs a real net/http-backed one from
 	// PhoneNumberID/BusinessAccountID/AccessToken/RequestTimeout.
 	Client            WhatsAppCloudAPIClient
@@ -127,7 +157,14 @@ func NewMetaCloudWhatsAppDispatcher(deps MetaCloudDispatcherDeps) (WhatsAppSende
 		if timeout <= 0 {
 			timeout = 10 * time.Second
 		}
-		client = newRealWhatsAppCloudAPIClient(deps.PhoneNumberID, deps.BusinessAccountID, deps.AccessToken, timeout)
+		version := deps.GraphAPIVersion
+		if version == "" {
+			version = defaultMetaGraphAPIVersion
+		}
+		if !metaGraphAPIVersionPattern.MatchString(version) {
+			return nil, fmt.Errorf("grpop/metacloud: GraphAPIVersion %q is not a Graph API version like v26.0", version)
+		}
+		client = newRealWhatsAppCloudAPIClient(deps.PhoneNumberID, deps.BusinessAccountID, deps.AccessToken, version, timeout)
 	}
 
 	return &metaCloudDispatcher{
@@ -227,6 +264,7 @@ type metaCloudAPIClient struct {
 	phoneNumberID     string
 	businessAccountID string
 	accessToken       string
+	apiVersion        string
 	// baseURL defaults to metaGraphAPIBaseURL; overridable only by tests, so
 	// doJSON's request-building/response/error-envelope-parsing logic can be
 	// exercised against a real local httptest.Server instead of Meta itself.
@@ -235,12 +273,13 @@ type metaCloudAPIClient struct {
 
 var _ WhatsAppCloudAPIClient = (*metaCloudAPIClient)(nil)
 
-func newRealWhatsAppCloudAPIClient(phoneNumberID, businessAccountID, accessToken string, timeout time.Duration) *metaCloudAPIClient {
+func newRealWhatsAppCloudAPIClient(phoneNumberID, businessAccountID, accessToken, apiVersion string, timeout time.Duration) *metaCloudAPIClient {
 	return &metaCloudAPIClient{
 		httpClient:        &http.Client{Timeout: timeout},
 		phoneNumberID:     phoneNumberID,
 		businessAccountID: businessAccountID,
 		accessToken:       accessToken,
+		apiVersion:        apiVersion,
 		baseURL:           metaGraphAPIBaseURL,
 	}
 }
@@ -301,7 +340,7 @@ func (c *metaCloudAPIClient) SendTemplateMessage(ctx context.Context, req WhatsA
 		body.Template.Components = []metaTemplateComponent{{Type: "body", Parameters: params}}
 	}
 
-	url := fmt.Sprintf("%s/%s/%s/messages", c.baseURL, metaGraphAPIVersion, c.phoneNumberID)
+	url := fmt.Sprintf("%s/%s/%s/messages", c.baseURL, c.apiVersion, c.phoneNumberID)
 	respBody, err := c.doJSON(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return WhatsAppCloudAPIResponse{}, err
@@ -351,7 +390,7 @@ func (c *metaCloudAPIClient) GetApprovedTemplates(ctx context.Context) ([]WhatsA
 		return nil, errors.New("grpop/metacloud: MetaCloudDispatcherDeps.BusinessAccountID is required to list approved templates")
 	}
 	url := fmt.Sprintf("%s/%s/%s/message_templates?fields=name,language,status,components&limit=200",
-		c.baseURL, metaGraphAPIVersion, c.businessAccountID)
+		c.baseURL, c.apiVersion, c.businessAccountID)
 	respBody, err := c.doJSON(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
@@ -423,11 +462,25 @@ func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, url string, pay
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var envelope metaErrorEnvelope
+		code := 0
+		var apiErr error
 		if json.Unmarshal(respBody, &envelope) == nil && envelope.Error.Message != "" {
-			return nil, fmt.Errorf("grpop/metacloud: graph api error (status %d, code %d): %s",
-				resp.StatusCode, envelope.Error.Code, envelope.Error.Message)
+			code = envelope.Error.Code
+			apiErr = fmt.Errorf("grpop/metacloud: graph api error (status %d, code %d): %s",
+				resp.StatusCode, code, envelope.Error.Message)
+		} else {
+			apiErr = fmt.Errorf("grpop/metacloud: graph api error: status %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("grpop/metacloud: graph api error: status %d", resp.StatusCode)
+		if !metaErrorIsTemporary(resp.StatusCode, code) {
+			apiErr = permanent(apiErr)
+		}
+		return nil, apiErr
 	}
 	return respBody, nil
+}
+
+// metaErrorIsTemporary reports whether a Graph API refusal is worth another
+// attempt later: one of metaTemporaryErrorCodes, a 429, or a 5xx.
+func metaErrorIsTemporary(status, code int) bool {
+	return metaTemporaryErrorCodes[code] || status == http.StatusTooManyRequests || status >= 500
 }

@@ -45,15 +45,15 @@ type compiledEmailTemplate struct {
 func compileEmailTemplate(tmpl EmailTemplate) (*compiledEmailTemplate, error) {
 	subjectTmpl, err := texttemplate.New("subject").Parse(tmpl.SubjectTemplate)
 	if err != nil {
-		return nil, fmt.Errorf("grpop: parsing subject template: %w", err)
+		return nil, permanent(fmt.Errorf("grpop: parsing subject template: %w", err))
 	}
 	htmlBodyTmpl, err := htmltemplate.New("htmlBody").Parse(tmpl.HTMLBodyTemplate)
 	if err != nil {
-		return nil, fmt.Errorf("grpop: parsing HTML body template: %w", err)
+		return nil, permanent(fmt.Errorf("grpop: parsing HTML body template: %w", err))
 	}
 	textBodyTmpl, err := texttemplate.New("textBody").Parse(tmpl.TextBodyTemplate)
 	if err != nil {
-		return nil, fmt.Errorf("grpop: parsing text body template: %w", err)
+		return nil, permanent(fmt.Errorf("grpop: parsing text body template: %w", err))
 	}
 	return &compiledEmailTemplate{subjectTmpl: subjectTmpl, htmlBodyTmpl: htmlBodyTmpl, textBodyTmpl: textBodyTmpl}, nil
 }
@@ -68,13 +68,13 @@ func compileEmailTemplate(tmpl EmailTemplate) (*compiledEmailTemplate, error) {
 func executeEmailTemplate(compiled *compiledEmailTemplate, data map[string]any) (subject, htmlBody, textBody string, err error) {
 	var subjectBuf, htmlBuf, textBuf bytes.Buffer
 	if err := compiled.subjectTmpl.Execute(&subjectBuf, data); err != nil {
-		return "", "", "", fmt.Errorf("grpop: rendering subject: %w", err)
+		return "", "", "", permanent(fmt.Errorf("grpop: rendering subject: %w", err))
 	}
 	if err := compiled.htmlBodyTmpl.Execute(&htmlBuf, data); err != nil {
-		return "", "", "", fmt.Errorf("grpop: rendering HTML body: %w", err)
+		return "", "", "", permanent(fmt.Errorf("grpop: rendering HTML body: %w", err))
 	}
 	if err := compiled.textBodyTmpl.Execute(&textBuf, data); err != nil {
-		return "", "", "", fmt.Errorf("grpop: rendering text body: %w", err)
+		return "", "", "", permanent(fmt.Errorf("grpop: rendering text body: %w", err))
 	}
 	return strings.TrimSpace(subjectBuf.String()), htmlBuf.String(), strings.TrimSpace(textBuf.String()), nil
 }

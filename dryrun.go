@@ -45,7 +45,7 @@ func (s *dryRunEmailSender) Send(ctx context.Context, msg EmailMessage) (SendRes
 	if err := ctx.Err(); err != nil {
 		return SendResult{}, err
 	}
-	s.logger.Info("grpop/dryrun: email not sent (dry run)", "to", msg.To, "content", emailContentDescription(msg))
+	s.logger.Info("grpop/dryrun: email not sent (dry run)", "to", maskedRecipient(msg.To), "content", emailContentDescription(msg))
 	return SendResult{
 		Channel:           ChannelEmail,
 		ProviderMessageID: "dryrun-" + generateMemoryID(),

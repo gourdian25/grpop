@@ -21,6 +21,7 @@
 ├── dryrun.go
 ├── dryrun_test.go
 ├── errors.go
+├── errors_test.go
 ├── example/
 │   ├── main.go
 │   └── templates_auth.go
@@ -44,4 +45,4 @@
 ├── types.go
 └── version.go
 
-3 directories, 41 files
+3 directories, 42 files

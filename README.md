@@ -90,7 +90,14 @@ result, err := sender.Send(ctx, grpop.EmailMessage{
     TemplateName: "password-reset",
     TemplateData: map[string]any{"ResetLink": link},
 })
-// err != nil: this attempt failed; your retry decides what happens next.
+switch {
+case err == nil:
+    // accepted by the vendor
+case errors.Is(err, grpop.ErrPermanent):
+    // it will fail the same way every time: stop
+default:
+    // temporary: your retry tries again later
+}
 ```
 
 See [example/main.go](example/main.go) and
@@ -170,14 +177,32 @@ loop.
 
 Sentinel errors (`errors.go`), matched with `errors.Is` — there is
 deliberately no `IsX(err) bool` helper, consistent with every other
-`gourdian25` repo:
+`gourdian25` repo.
 
-`ErrRecipientRequired`, `ErrNoContentModeSet`, `ErrMultipleContentModesSet`,
-`ErrEmailTemplateNotFound`, `ErrInlineTemplateTooLarge`,
-`ErrEmailFromRequired`, `ErrEmailTemplateEngineRequired`,
-`ErrWhatsAppTemplateNameRequired`, `ErrWhatsAppLanguageCodeRequired`,
-`ErrWhatsAppTemplateNotApproved`, `ErrWhatsAppTemplateArityMismatch`,
-`ErrRateLimited`, `ErrCircuitOpen`, `ErrTooManyRequests`.
+**`ErrPermanent`** is the one a retry loop needs: every failure that will
+fail the same way on every attempt matches it, and nothing else does.
+
+- **Permanent:** the validation sentinels (`ErrRecipientRequired`,
+  `ErrNoContentModeSet`, `ErrMultipleContentModesSet`,
+  `ErrEmailTemplateNotFound`, `ErrInlineTemplateTooLarge`,
+  `ErrEmailFromRequired`, `ErrEmailTemplateEngineRequired`,
+  `ErrInvalidAddress`, `ErrWhatsAppTemplateNameRequired`,
+  `ErrWhatsAppLanguageCodeRequired`, `ErrWhatsAppTemplateNotApproved`,
+  `ErrWhatsAppTemplateArityMismatch`), a template that won't render, an SMTP
+  `5xx` reply (a mailbox that doesn't exist, a refused sender, bad
+  credentials), and a Meta refusal of the request, the account or the
+  template.
+- **Temporary:** `ErrRateLimited`, `ErrCircuitOpen`, `ErrTooManyRequests`,
+  an SMTP `4xx` reply, a dial, TLS or network failure, a timeout, a
+  cancelled context, a Meta `429` or `5xx`, and Meta's retry-later codes (2,
+  4, 80007, 130429, 131000, 131016, 131056, 133004, 2494100).
+
+`ErrInvalidAddress` covers a `From`, `To` or `Reply-To` that `net/mail` can't
+parse or that carries a line break (which would add a header of its own); it
+names the field, never the value. Display names are fine
+(`"Acme <no-reply@acme.test>"`): the headers carry them, `MAIL FROM` and
+`RCPT TO` the bare addresses. Logs show an address masked
+(`a***@example.com`), including inside an SMTP reply that echoes it.
 
 ## Limitations / out of scope
 
@@ -200,6 +225,9 @@ deliberately no `IsX(err) bool` helper, consistent with every other
   tested against a fake `WhatsAppCloudAPIClient` and an `httptest` server.
 - **grpop never refreshes or rotates a Meta access token.** Token lifecycle
   is entirely the operator's responsibility.
+- **Meta retires a Graph API version about two years after release.**
+  `MetaCloudDispatcherDeps.GraphAPIVersion` defaults to `v26.0` (released
+  2026-07-29); set it to move ahead of grpop's default.
 - **`CircuitBreaker` state is per-process, deliberately not centralized** —
   avoids a synchronized thundering-herd retry the moment a relay recovers.
 

@@ -97,23 +97,41 @@ rendering on `SMTPDispatcherDeps.TemplateEngine`, since content-mode
 resolution (`TemplateName`/`InlineTemplate`/literal) has to happen
 immediately before the MIME message is built.
 
-### 3.3 A failure is the returned error
+### 3.3 A failure is the returned error, and says whether to retry
 
 `Send` returns `(SendResult{Status: SendStatusFailed}, err)` for a failed
 attempt and `(result, nil)` for an accepted one; there is no second channel
-for "failed but handled". Validation failures (`ErrRecipientRequired`,
-`ErrNoContentModeSet`, `ErrEmailFromRequired`,
-`ErrWhatsAppTemplateNotApproved`, ...) fail identically on every attempt,
-so a caller's retry should stop on them.
+for "failed but handled". `errors.Is(err, ErrPermanent)` tells a caller's
+retry to stop (0.2.0, P2): every validation sentinel is built with
+`permanent`, so it matches `ErrPermanent` and still itself, and a sender
+wraps a vendor's final refusal the same way, keeping its message and chain
+(`errors.As` still finds the `*textproto.Error`). SMTP: a `5xx` reply is
+permanent, a `4xx` and every transport failure temporary. Meta: its
+retry-later codes (read from its error reference, listed in
+`metaTemporaryErrorCodes`), a `429` and a `5xx` are temporary, every other
+refusal permanent. The circuit breaker still counts every failure, a
+permanent one included.
 
-### 3.4 The Meta Cloud API client: hand-rolled, narrow, fake-tested
+### 3.4 Addresses are parsed, and logged masked
+
+`From`, `To` and `Reply-To` go through `net/mail.ParseAddress`
+(`parseEmailAddress`), and a CR or LF anywhere is refused first: written
+into a header unchecked, a line break let `Reply-To` add a `Bcc` line
+(found 2026-10-23; `MAIL FROM` and `RCPT TO` were safe only because
+`net/smtp` refuses line breaks there). The headers carry the parsed form (a
+display name quoted or Q-encoded), the envelope and the recipient's
+rate-limit key the bare address, and a bad `DefaultFrom` fails at
+construction. Log lines carry `maskEmail`'s `a***@example.com`, and an SMTP
+reply that echoes an address is masked before it is logged.
+
+### 3.5 The Meta Cloud API client: hand-rolled, narrow, fake-tested
 
 `WhatsAppCloudAPIClient` is grpop's own thin interface over two Graph API
 endpoints (`SendTemplateMessage`, `GetApprovedTemplates`) — no official Go
 SDK exists for WhatsApp regardless of vendor, so a hand-rolled `net/http` +
 `encoding/json` client (`metaCloudAPIClient`) was always required. Sending
 uses `PhoneNumberID`; listing approved templates (which backs
-`TemplateValidator`, §3.5) needs the WhatsApp Business Account ID instead —
+`TemplateValidator`, §3.6) needs the WhatsApp Business Account ID instead —
 a separate ID Meta assigns, added to `MetaCloudDispatcherDeps` as
 `BusinessAccountID` during implementation once this distinction became
 concrete (the original plan draft didn't separate the two IDs). This is
@@ -122,9 +140,11 @@ policy: Meta's Graph API has no local emulator, so `metaCloudDispatcher`'s
 own rate-limiter/circuit-breaker wiring is tested against a fake
 `WhatsAppCloudAPIClient`, and the real HTTP client's own request-building/
 auth-header/error-envelope-parsing logic is separately tested against a
-real local `httptest.Server` (not Meta itself, but a real HTTP round trip).
+real local `httptest.Server` (not Meta itself, but a real HTTP round trip). Every call names `GraphAPIVersion` (default
+`v26.0`; Meta retires a version about two years after release, and the
+earlier hard-coded `v20.0` stopped on 2026-09-24).
 
-### 3.5 `TemplateValidator`: advisory, TTL-cached, never a false negative
+### 3.6 `TemplateValidator`: advisory, TTL-cached, never a false negative
 
 Meta requires every WhatsApp template to go through approval before use;
 `TemplateValidator.Validate` checks both approval status and that
@@ -142,7 +162,7 @@ so the cache can only ever produce a false *positive* window (a
 since-revoked template briefly still looks approved), never a false
 negative that blocks a send that would have succeeded.
 
-### 3.6 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
+### 3.7 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
 
 `SMTPClient` (`Auth`/`Mail`/`Rcpt`/`Data`/`Close`) is satisfied directly by
 `*net/smtp.Client` — no adapter type needed. `SMTPDialer.Dial` performs the
@@ -178,5 +198,5 @@ recipient key and the fail-closed policy carry over to `checkRateLimits`
 The SMTP sender is tested against a **real local Mailpit** (`t.Skip`-ing
 when it isn't reachable) as well as a fake `SMTPClient`; `-race` is
 mandatory. The Meta Cloud API client is the one documented exception
-(§3.4): a fake client for the sender's wiring, an `httptest.Server` for the
+(§3.5): a fake client for the sender's wiring, an `httptest.Server` for the
 real HTTP client. `make coverage-check` gates the package at 95%.

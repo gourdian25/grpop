@@ -106,3 +106,17 @@ func TestDryRunSenders_UniqueMessageIDs(t *testing.T) {
 		seen[result.ProviderMessageID] = true
 	}
 }
+
+// TestDryRunEmailSender_LogsMaskedRecipient: the dry run's log line names
+// the recipient masked, never in full.
+func TestDryRunEmailSender_LogsMaskedRecipient(t *testing.T) {
+	logger := &argsLogger{}
+	sender := NewDryRunEmailSender(logger)
+	if _, err := sender.Send(context.Background(), EmailMessage{To: "Ada <ada@example.com>", Subject: "s", TextBody: "b"}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+	logged := logger.all()
+	if strings.Contains(logged, "ada@example.com") || !strings.Contains(logged, "a***@example.com") {
+		t.Fatalf("dry-run log = %q, want the masked recipient only", logged)
+	}
+}
