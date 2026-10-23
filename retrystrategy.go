@@ -16,10 +16,10 @@ const defaultMaxBackoff = 30 * time.Second
 // base*2^attempt)) — the AWS "Full Jitter" formula. This mirrors
 // grevents' retry.go computeBackoff and grnoti's own FullJitterBackoff
 // exactly, deliberately kept identical rather than inventing a third copy
-// of the same formula. It is exported so it can be shared by both
-// Service's inline per-call retry (docs.go, "no message broker") and the
-// Postgres/Mongo DLQHandler backends' own NextRetryAt computation
-// (Stage 6/7), instead of two independently-written copies.
+// of the same formula. grpop sends each message once and never retries, so
+// it is exported for the caller's own retry loop: the wait before the next
+// attempt, which the caller also caps at the message's own expiry (see
+// example/main.go's sendWithRetry).
 //
 // Parameters:
 //   - base: time.Duration — the starting point; base<=0 returns 0

@@ -104,10 +104,14 @@ type SMTPDispatcherDeps struct {
 	// template-mode message returns ErrEmailTemplateEngineRequired.
 	TemplateEngine EmailTemplateEngine
 
-	RateLimiter    RateLimiter
-	CircuitBreaker CircuitBreaker
-	Metrics        Metrics
-	Logger         Logger
+	// RateLimiter bounds the whole channel and RecipientRateLimiter each
+	// recipient (see RateLimiter's doc comment); both optional. A refusal
+	// is ErrRateLimited at once: Send never waits for a token.
+	RateLimiter          RateLimiter
+	RecipientRateLimiter RateLimiter
+	CircuitBreaker       CircuitBreaker
+	Metrics              Metrics
+	Logger               Logger
 }
 
 // smtpDispatcher implements EmailSender over SMTP. It holds no persistent
@@ -122,6 +126,7 @@ type smtpDispatcher struct {
 	dialer         SMTPDialer
 	templateEngine EmailTemplateEngine
 	rateLimiter    RateLimiter
+	recipientLimit RateLimiter
 	circuitBreaker CircuitBreaker
 	metrics        Metrics
 	logger         Logger
@@ -177,6 +182,7 @@ func NewSMTPDispatcher(deps SMTPDispatcherDeps) (EmailSender, error) {
 		dialer:         dialer,
 		templateEngine: deps.TemplateEngine,
 		rateLimiter:    deps.RateLimiter,
+		recipientLimit: deps.RecipientRateLimiter,
 		circuitBreaker: deps.CircuitBreaker,
 		metrics:        deps.Metrics,
 		logger:         OrNop(deps.Logger),
@@ -205,10 +211,8 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 		return SendResult{}, ErrEmailFromRequired
 	}
 
-	if d.rateLimiter != nil {
-		if err := d.rateLimiter.Wait(ctx, ChannelEmail, msg.To); err != nil {
-			return SendResult{}, fmt.Errorf("grpop/smtp: rate limiter wait: %w", err)
-		}
+	if err := checkRateLimits(ctx, ChannelEmail, msg.To, d.rateLimiter, d.recipientLimit, d.metrics); err != nil {
+		return SendResult{}, err
 	}
 
 	messageID := fmt.Sprintf("%s@%s", generateMemoryID(), messageIDDomain(from))

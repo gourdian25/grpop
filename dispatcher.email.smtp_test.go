@@ -96,7 +96,7 @@ type fakeMetrics struct {
 	sendResults         []SendStatus
 	responseCodes       []int
 	latencyObservations int
-	dedupHits           int
+	rateLimitRejected   int
 }
 
 func (m *fakeMetrics) ObserveSendLatency(_ Channel, _ time.Duration) {
@@ -109,36 +109,43 @@ func (m *fakeMetrics) IncSendResult(_ Channel, status SendStatus) {
 	m.sendResults = append(m.sendResults, status)
 	m.mu.Unlock()
 }
-func (m *fakeMetrics) IncRateLimitRejected(_ Channel)                   {}
-func (m *fakeMetrics) IncDLQPublished(_ Channel)                        {}
-func (m *fakeMetrics) IncCircuitBreakerStateChange(_ Channel, _ string) {}
-func (m *fakeMetrics) IncIdempotencyDedupHit(_ Channel) {
+func (m *fakeMetrics) IncRateLimitRejected(_ Channel) {
 	m.mu.Lock()
-	m.dedupHits++
+	m.rateLimitRejected++
 	m.mu.Unlock()
 }
+func (m *fakeMetrics) IncCircuitBreakerStateChange(_ Channel, _ string) {}
 func (m *fakeMetrics) ObserveSMTPResponseCode(code int) {
 	m.mu.Lock()
 	m.responseCodes = append(m.responseCodes, code)
 	m.mu.Unlock()
 }
 
-// fakeChannelRateLimiter is a fake RateLimiter whose Wait can be forced to
-// fail, for asserting Send never dials when the rate limiter rejects.
-type fakeChannelRateLimiter struct {
-	waitErr   error
-	waitCalls int
+// fakeRateLimiter is a RateLimiter (grlimiter.Limiter's shape) that
+// allows or refuses every key, or fails, and records the keys it was asked
+// about.
+type fakeRateLimiter struct {
+	refuse bool
+	err    error
+
+	mu   sync.Mutex
+	keys []string
 }
 
-func (l *fakeChannelRateLimiter) Allow(_ context.Context, _ Channel, _ string) (bool, error) {
-	return l.waitErr == nil, l.waitErr
+func (l *fakeRateLimiter) Allow(_ context.Context, key string) (bool, error) {
+	l.mu.Lock()
+	l.keys = append(l.keys, key)
+	l.mu.Unlock()
+	if l.err != nil {
+		return false, l.err
+	}
+	return !l.refuse, nil
 }
-func (l *fakeChannelRateLimiter) Wait(_ context.Context, _ Channel, _ string) error {
-	l.waitCalls++
-	return l.waitErr
-}
-func (l *fakeChannelRateLimiter) GetStats(_ context.Context, _ Channel, _ string) (RateLimiterStats, error) {
-	return RateLimiterStats{}, nil
+
+func (l *fakeRateLimiter) asked() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.keys...)
 }
 
 func newTestSMTPDispatcher(t *testing.T, client SMTPClient, mutate func(*SMTPDispatcherDeps)) (EmailSender, *fakeSMTPDialer) {
@@ -339,7 +346,7 @@ func TestSMTPDispatcher_Send_RcptErrorRecordsResponseCode(t *testing.T) {
 }
 
 func TestSMTPDispatcher_Send_RateLimiterBlocksBeforeDial(t *testing.T) {
-	limiter := &fakeChannelRateLimiter{waitErr: ErrRateLimited}
+	limiter := &fakeRateLimiter{refuse: true}
 	client := &fakeSMTPClient{}
 	sender, dialer := newTestSMTPDispatcher(t, client, func(d *SMTPDispatcherDeps) { d.RateLimiter = limiter })
 
@@ -347,8 +354,8 @@ func TestSMTPDispatcher_Send_RateLimiterBlocksBeforeDial(t *testing.T) {
 	if !errors.Is(err, ErrRateLimited) {
 		t.Fatalf("Send() err = %v, want to wrap ErrRateLimited", err)
 	}
-	if limiter.waitCalls != 1 {
-		t.Fatalf("waitCalls = %d, want 1", limiter.waitCalls)
+	if got := limiter.asked(); len(got) != 1 || got[0] != "email" {
+		t.Fatalf("limiter asked about %v, want [email]", got)
 	}
 	if dialer.calls() != 0 {
 		t.Fatalf("dial count = %d, want 0 (rate limiter should have blocked before dial)", dialer.calls())

@@ -99,8 +99,8 @@ const (
 	SendStatusFailed SendStatus = "failed" // the vendor rejected the request, or the call itself errored
 )
 
-// SendResult is the delivery-status handle every Service.SendX call
-// returns.
+// SendResult is what every sender's Send returns: what the vendor said,
+// for the one attempt it made.
 type SendResult struct {
 	Channel           Channel
 	ProviderMessageID string // vendor's own message/tracking ID (Meta's wamid, or the
@@ -108,110 +108,6 @@ type SendResult struct {
 	Status SendStatus
 	SentAt time.Time
 	Raw    map[string]string // optional vendor-specific diagnostic fields — logging only
-
-	// Duplicate is true if this call short-circuited on
-	// IdempotencyStore.IsProcessed (the same IdempotencyKey was already
-	// marked processed) rather than performing a new vendor call. A dedup
-	// hit is not silent: Service also logs a Warn and increments
-	// Metrics.IncIdempotencyDedupHit on every hit regardless of whether the
-	// caller inspects this field — see Service's doc comment.
-	Duplicate bool
-}
-
-// SendOptions carries per-send cross-cutting behavior.
-type SendOptions struct {
-	// IdempotencyKey is REQUIRED — Service.SendEmail/SendWhatsApp return
-	// ErrIdempotencyKeyRequired if it's empty. grpop's inline retry-on-
-	// transient-failure is at-least-once, not exactly-once (docs.go): a
-	// network error after the vendor already accepted the message is
-	// indistinguishable from one before, so a retry can double-send. The
-	// guarantee against a caller-visible double-send comes entirely from
-	// the caller supplying a stable key and IdempotencyStore catching the
-	// redelivery.
-	IdempotencyKey string
-	IdempotencyTTL time.Duration // 0 uses the configured default
-	SkipRateLimit  bool          // escape hatch, e.g. an admin-triggered manual resend
-
-	// RetryExpiresAt is the hard wall-clock deadline after which grpop
-	// stops retrying a failed send entirely, regardless of remaining
-	// retry-count budget. Zero value uses the configured default max retry
-	// age, measured from the first failure, not from this call. Callers
-	// who know their own message's real expiry (a password-reset link's
-	// TTL, an invite token's expiry) should set this explicitly rather
-	// than relying on the library default.
-	RetryExpiresAt time.Time
-}
-
-// DLQStatus is a DLQEvent's lifecycle state.
-type DLQStatus string
-
-const (
-	// DLQStatusPending is newly-recorded or awaiting its next retry.
-	DLQStatusPending DLQStatus = "pending"
-	// DLQStatusRetrying means a worker currently holds an atomic claim on
-	// this event (see DLQHandler.ClaimRetryableEvents) and is attempting
-	// delivery — not a status any caller sets directly.
-	DLQStatusRetrying DLQStatus = "retrying"
-	// DLQStatusResolved means a retry eventually succeeded.
-	DLQStatusResolved DLQStatus = "resolved"
-	// DLQStatusExhausted means RetryCount reached MaxRetries before
-	// ExpiresAt passed.
-	DLQStatusExhausted DLQStatus = "exhausted"
-	// DLQStatusExpired means ExpiresAt passed before a successful retry,
-	// independent of remaining RetryCount budget. Unrelated to
-	// DLQHandler.PurgeExpiredEvents' own, different sense of "expired"
-	// (old enough to delete) — see that method's doc comment.
-	DLQStatusExpired DLQStatus = "expired"
-)
-
-// DLQMessage is a channel-tagged envelope — exactly one of Email/WhatsApp
-// is non-nil, matching Channel.
-type DLQMessage struct {
-	Channel  Channel
-	Email    *EmailMessage
-	WhatsApp *WhatsAppMessage
-
-	// ExpiresAt is the hard wall-clock deadline after which this event
-	// stops being retried at all, regardless of remaining RetryCount
-	// budget — set by Service from SendOptions.RetryExpiresAt or the
-	// configured default max retry age before PublishToDLQ is called.
-	ExpiresAt time.Time
-}
-
-// DLQRetryAttempt records the outcome of one retry attempt for a DLQEvent.
-type DLQRetryAttempt struct {
-	AttemptNumber int
-	AttemptedAt   time.Time
-	Success       bool
-	ErrorMessage  string
-}
-
-// DLQEvent is the durable record of one failed send, awaiting retry or
-// already Resolved/Exhausted/Expired.
-type DLQEvent struct {
-	SendID         string
-	MessageData    DLQMessage // carries Channel and ExpiresAt
-	FailureReason  string
-	RetryCount     int
-	MaxRetries     int
-	FirstFailureAt time.Time
-	LastAttemptAt  time.Time
-	NextRetryAt    time.Time
-	Status         DLQStatus
-	AttemptHistory []DLQRetryAttempt // capped at a configured maximum entry count, oldest dropped first
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-}
-
-// RateLimiterStats is a point-in-time snapshot of one (channel, recipient)
-// bucket's counters.
-type RateLimiterStats struct {
-	RequestsPerSecond int
-	BurstSize         int
-	AllowedCount      int64
-	BlockedCount      int64
-	WaitCount         int64
-	LastAllowedAt     time.Time
 }
 
 // CircuitState is a CircuitBreaker's current state.

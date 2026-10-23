@@ -4,15 +4,10 @@ package grpop
 
 import "errors"
 
-// Sentinel errors for use with errors.Is. Backend implementations translate
-// their own native errors (pgx.ErrNoRows, redis.Nil, mongo.ErrNoDocuments,
-// a vendor SDK's own error type, ...) into these sentinels before wrapping
-// with fmt.Errorf("...: %w", ...) — a backend-native error must never leak
-// through a grpop interface unwrapped, matching grcache's, graudit's, and
-// grnoti's own documented rule.
+// Sentinel errors for use with errors.Is.
 //
 // There is deliberately no IsX(err error) bool helper: callers use
-// errors.Is(err, grpop.ErrClosed) directly, consistent with every other
+// errors.Is(err, grpop.ErrRateLimited) directly, consistent with every other
 // gourdian repo's sentinel-error convention.
 //
 // Distinct conditions get distinct sentinels rather than being reused
@@ -25,20 +20,6 @@ import "errors"
 // ErrWhatsAppTemplateNotApproved and ErrWhatsAppTemplateArityMismatch are
 // the two distinct reasons TemplateValidator.Validate can fail.
 var (
-	// ErrClosed indicates a method was called after Close.
-	ErrClosed = errors.New("grpop: closed")
-
-	// ErrBackendUnavailable indicates a storage backend or vendor
-	// connection could not be reached (connection failure, timeout, etc.).
-	ErrBackendUnavailable = errors.New("grpop: backend unavailable")
-
-	// ErrIdempotencyKeyRequired indicates SendOptions.IdempotencyKey was
-	// empty. Required, not optional (docs.go, plan §9 item 8): grpop's
-	// inline retry is at-least-once, not exactly-once, so the guarantee
-	// against a caller-visible double-send comes entirely from a caller-
-	// supplied stable key and IdempotencyStore catching the redelivery.
-	ErrIdempotencyKeyRequired = errors.New("grpop: idempotency key is required")
-
 	// ErrRecipientRequired indicates EmailMessage.To or WhatsAppMessage.To
 	// was empty.
 	ErrRecipientRequired = errors.New("grpop: recipient is required")
@@ -83,20 +64,10 @@ var (
 	// len(TemplateVariables) does not match its expected parameter count.
 	ErrWhatsAppTemplateArityMismatch = errors.New("grpop: whatsapp template variable count does not match the approved template's expected parameter count")
 
-	// ErrRateLimited indicates RateLimiter.Allow reported no token
-	// available (per-channel or per-recipient bucket exhausted) for a
-	// Send call that did not opt into SendOptions.SkipRateLimit.
+	// ErrRateLimited indicates a sender's RateLimiter or
+	// RecipientRateLimiter refused the send. Temporary: the send was not
+	// attempted, and the caller's own retry tries again later.
 	ErrRateLimited = errors.New("grpop: rate limited")
-
-	// ErrDLQEventNotFound indicates a DLQHandler lookup found no DLQEvent
-	// for the requested send ID.
-	ErrDLQEventNotFound = errors.New("grpop: dead-letter event not found")
-
-	// ErrDLQEventNotClaimed indicates MarkRetried was called for an event
-	// that is not currently in the "retrying" (claimed) state — either it
-	// was never claimed via ClaimRetryableEvents, already resolved/
-	// exhausted/expired, or claimed by a concurrent caller.
-	ErrDLQEventNotClaimed = errors.New("grpop: dead-letter event is not in a claimed (retrying) state")
 
 	// ErrEmailFromRequired indicates both EmailMessage.From and the
 	// dispatcher's configured DefaultFrom were empty — SMTP requires a MAIL

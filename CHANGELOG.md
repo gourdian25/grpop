@@ -2,34 +2,46 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.2.0] - 2026-09-05
+## [0.2.0] - Unreleased
 
-Migrates the Mongo DLQ backend from `go.mongodb.org/mongo-driver` (v1,
-upstream-deprecated) to `go.mongodb.org/mongo-driver/v2`, matching
-grsentry's already-completed migration and bringing grpop in line with the
-rest of the `gourdian25` org. `MongoDLQHandlerConfig`/`NewMongoDLQHandler`
-never exposed a driver type in their exported signature, so this is an
-internal dependency swap only — no change to `NewMongoDLQHandler`'s
-signature or behavior for grpop's own consumers.
+**Breaking: grpop is delivery only.** A sender sends one message once and
+reports what the vendor said; grpop keeps nothing and retries nothing.
+Retrying, keeping a message durably and suppressing duplicates are the
+caller's (decided 2026-10-23 for grsentry's email work, which does all three
+with an outbox; see `docs/plan/2026-10-23-grpop-delivery-only.md`). An
+earlier draft of this version, never tagged, moved the Mongo dead-letter
+backend to `mongo-driver/v2`; that backend is now removed.
+
+### Removed
+
+- `Service`, `NewService`, `ServiceDeps`, `ServiceConfig`,
+  `DefaultServiceConfig`, `SendOptions` and `SendResult.Duplicate`.
+- `IdempotencyStore` and `NewCacheIdempotencyStore`.
+- `DLQHandler` and its three backends (`NewMemoryDLQHandler`,
+  `NewPostgresDLQHandler`, `NewMongoDLQHandler`), the `grpop_dlq` schema,
+  `PostgresConfig`, the `DLQ*` types, and `MessageEncryptor`.
+- The lifecycle events (`TopicMessageSent`, `TopicMessageFailed`,
+  `PublishMessageSent`, `PublishMessageFailed`).
+- grpop's own rate limiters (`NewLocalRateLimiter`, `NewRedisRateLimiter`)
+  and `RateLimiterStats`.
+- `ErrClosed`, `ErrBackendUnavailable`, `ErrIdempotencyKeyRequired`,
+  `ErrDLQEventNotFound`, `ErrDLQEventNotClaimed`; `Metrics.IncDLQPublished`
+  and `Metrics.IncIdempotencyDedupHit`.
+- Every third-party dependency: pgx, mongo-driver, go-redis, grcache,
+  grevents and `golang.org/x/time`.
 
 ### Changed
 
-- `dlq.mongo.go` now imports `go.mongodb.org/mongo-driver/v2/{bson,mongo,mongo/options}`.
-  `mongo.Connect` dropped its `context.Context` parameter in v2 (it never
-  blocked on the network — `Ping` remains the real connectivity check), so
-  the 10s connect timeout that used to bound `Connect` now bounds the
-  subsequent `Ping` call instead. v1's generic `options.Update()` is
-  removed in v2 (replaced by separate `options.UpdateOne()`/
-  `options.UpdateMany()` builders); `PublishToDLQ`'s upsert, paired with
-  `UpdateOne`, now uses `options.UpdateOne().SetUpsert(true)`.
-  `mongo.ErrNoDocuments`, `options.ReturnDocument`/`options.After`, and
-  `options.Index()`/`options.FindOneAndUpdate()` are unchanged.
-- `go.mod`: `go.mongodb.org/mongo-driver v1.17.9` replaced with
-  `go.mongodb.org/mongo-driver/v2 v2.8.0` as a direct dependency.
-  `github.com/gourdian25/grcache` (used by the `grcache`-backed
-  `IdempotencyStore` adapter) bumped from `v0.3.1` to `v0.5.0` to pick up
-  grcache's own v2 migration — v1 no longer appears anywhere in `go.mod`/
-  `go.sum`, direct or indirect.
+- `RateLimiter` is now `Allow(ctx context.Context, key string) (bool, error)`,
+  the method set of grsentry's `pkg/grlimiter.Limiter`, so that limiter
+  plugs in as it is. Each sender's deps take two, both optional:
+  `RateLimiter` (key: the channel) and `RecipientRateLimiter` (key: the
+  channel and a SHA-256 of the recipient). A refused send returns
+  `ErrRateLimited` at once instead of waiting for a token; a limiter error
+  stops the send. `Metrics.IncRateLimitRejected` now counts refusals.
+- `make docker-up`/`docker-down` start and stop Mailpit only.
+- `example/` sends through the SMTP sender with a caller-side retry loop on
+  `FullJitterBackoff`.
 
 ## [0.1.0] - 2026-07-31
 

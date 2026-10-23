@@ -80,10 +80,14 @@ type MetaCloudDispatcherDeps struct {
 	// PhoneNumberID/BusinessAccountID/AccessToken/RequestTimeout.
 	Client            WhatsAppCloudAPIClient
 	TemplateValidator TemplateValidator
-	RateLimiter       RateLimiter
-	CircuitBreaker    CircuitBreaker
-	Metrics           Metrics
-	Logger            Logger
+	// RateLimiter bounds the whole channel and RecipientRateLimiter each
+	// recipient (see RateLimiter's doc comment); both optional. A refusal
+	// is ErrRateLimited at once: Send never waits for a token.
+	RateLimiter          RateLimiter
+	RecipientRateLimiter RateLimiter
+	CircuitBreaker       CircuitBreaker
+	Metrics              Metrics
+	Logger               Logger
 }
 
 // metaCloudDispatcher implements WhatsAppSender over Meta's Graph API.
@@ -91,6 +95,7 @@ type metaCloudDispatcher struct {
 	client            WhatsAppCloudAPIClient
 	templateValidator TemplateValidator
 	rateLimiter       RateLimiter
+	recipientLimit    RateLimiter
 	circuitBreaker    CircuitBreaker
 	metrics           Metrics
 	logger            Logger
@@ -129,6 +134,7 @@ func NewMetaCloudWhatsAppDispatcher(deps MetaCloudDispatcherDeps) (WhatsAppSende
 		client:            client,
 		templateValidator: deps.TemplateValidator,
 		rateLimiter:       deps.RateLimiter,
+		recipientLimit:    deps.RecipientRateLimiter,
 		circuitBreaker:    deps.CircuitBreaker,
 		metrics:           deps.Metrics,
 		logger:            OrNop(deps.Logger),
@@ -154,10 +160,8 @@ func (d *metaCloudDispatcher) Send(ctx context.Context, msg WhatsAppMessage) (Se
 		}
 	}
 
-	if d.rateLimiter != nil {
-		if err := d.rateLimiter.Wait(ctx, ChannelWhatsApp, msg.To); err != nil {
-			return SendResult{}, fmt.Errorf("grpop/metacloud: rate limiter wait: %w", err)
-		}
+	if err := checkRateLimits(ctx, ChannelWhatsApp, msg.To, d.rateLimiter, d.recipientLimit, d.metrics); err != nil {
+		return SendResult{}, err
 	}
 
 	req := WhatsAppCloudAPIRequest{

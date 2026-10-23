@@ -11,7 +11,7 @@ help:
 	@echo "Makefile targets for grpop:"
 	@echo ""
 	@echo "  make test             Run all tests"
-	@echo "  make race             Run tests with race detector (mandatory before any commit touching ratelimiter.go, dlq.*.go, or any store)"
+	@echo "  make race             Run tests with race detector (mandatory before any commit touching circuitbreaker.go, templateengine.email.go, or a sender)"
 	@echo "  make coverage         Generate HTML coverage report"
 	@echo "  make coverage-summary Show coverage summary by function"
 	@echo "  make coverage-check   Check the package meets the $(COVERAGE_MIN)% threshold"
@@ -21,20 +21,19 @@ help:
 	@echo "  make fmt              Format code"
 	@echo "  make clean            Clean build artifacts"
 	@echo "  make deps             Verify and tidy dependencies"
-	@echo "  make docker-up        Start the shared Postgres/Redis/Mongo (+ Mailpit) test containers (idempotent)"
-	@echo "  make docker-down      Stop those containers (state preserved for a fast restart)"
+	@echo "  make docker-up        Start the Mailpit test container (idempotent)"
+	@echo "  make docker-down      Stop it (state preserved for a fast restart)"
 	@echo "  make precommit        fmt + vet + lint + race + coverage-check — run before every commit"
 	@echo "  make prerelease       precommit + goreleaser-check — run before tagging a release"
 	@echo "  make tag VERSION=vX.Y.Z         Create and push a git tag"
 	@echo "  make release VERSION=vX.Y.Z     Tag, push, and run goreleaser release --clean"
 	@echo "  make goreleaser-check           Dry run: validate config + snapshot release (no tag/push)"
 	@echo ""
-	@echo "grpop is a single flat package (no subpackages) — every storage"
-	@echo "backend (Postgres/Mongo/Redis) and vendor dispatcher (SMTP, Meta"
-	@echo "WhatsApp Cloud API) lives in this one module. Backend tests need"
-	@echo "real local services; see CLAUDE.md for docker run commands."
-	@echo "Scope a run to one backend while iterating, e.g.:"
-	@echo "  go test -run TestDLQHandler_Contract/Memory ./..."
+	@echo "grpop is a single flat package (no subpackages) with no third-party"
+	@echo "dependencies: the SMTP and Meta WhatsApp Cloud API senders live in"
+	@echo "this one module. The SMTP integration test needs a local Mailpit"
+	@echo "(make docker-up). Scope a run while iterating, e.g.:"
+	@echo "  go test -run TestSMTPDispatcher ./..."
 
 test:
 	@echo "Running tests..."
@@ -107,46 +106,26 @@ deps:
 	$(GO) mod tidy
 	@echo "Dependency verification complete"
 
-# docker-up is idempotent: safe to run repeatedly, and safe to run
-# alongside gourdiantoken/grcache/graudit/grnoti's own `make docker-up`
-# since every gourdian25 repo shares these same container names/ports (see
-# CLAUDE.md) — each just gets its own database/keyspace inside them. The
-# Mailpit container is grpop-specific (Stage 10's SMTP dispatcher tests
-# against it as a real local double, not a fake — see docs/plan/grpop-plan.md
-# §1.2/§3); no other sibling repo needs it.
+# docker-up is idempotent: safe to run repeatedly. Mailpit is the one
+# backend grpop's tests use (the SMTP sender's integration test sends to it
+# as a real local double, not a fake); it is grpop-specific, no other
+# sibling repo needs it.
 docker-up:
-	@echo "Starting shared test containers..."
-	@docker inspect gourdian-postgres >/dev/null 2>&1 || docker run -d --name gourdian-postgres -p 5432:5432 \
-		-e POSTGRES_USER=postgres_user -e POSTGRES_PASSWORD=postgres_password -e POSTGRES_DB=grpop_test postgres:16
-	@docker start gourdian-postgres >/dev/null 2>&1 || true
-	@docker inspect gourdian-redis >/dev/null 2>&1 || docker run -d --name gourdian-redis -p 6379:6379 redis:7 --requirepass redis_password
-	@docker start gourdian-redis >/dev/null 2>&1 || true
-	@docker volume create gourdian-mongo-keyfile >/dev/null
-	@docker inspect gourdian-mongo-auth >/dev/null 2>&1 || (docker run --rm -v gourdian-mongo-keyfile:/keyfile-dir mongo:7 bash -c "openssl rand -base64 756 > /keyfile-dir/mongo-keyfile && chmod 400 /keyfile-dir/mongo-keyfile && chown 999:999 /keyfile-dir/mongo-keyfile" && docker run -d --name gourdian-mongo-auth -p 27018:27017 -e MONGO_INITDB_ROOT_USERNAME=root -e MONGO_INITDB_ROOT_PASSWORD=mongo_password -v gourdian-mongo-keyfile:/etc/mongo-keyfile-dir mongo:7 --replSet rs0 --keyFile /etc/mongo-keyfile-dir/mongo-keyfile)
-	@docker start gourdian-mongo-auth >/dev/null 2>&1 || true
+	@echo "Starting the Mailpit test container..."
 	@docker inspect gourdian-mailpit >/dev/null 2>&1 || docker run -d --name gourdian-mailpit -p 1025:1025 -p 8025:8025 axllent/mailpit
 	@docker start gourdian-mailpit >/dev/null 2>&1 || true
-	@echo "Waiting for Postgres..."
-	@until docker exec gourdian-postgres pg_isready -U postgres_user >/dev/null 2>&1; do sleep 1; done
-	@docker exec gourdian-postgres psql -U postgres_user -d postgres -tc "SELECT 1 FROM pg_database WHERE datname = 'grpop_test'" | grep -q 1 || \
-		docker exec gourdian-postgres psql -U postgres_user -d postgres -c "CREATE DATABASE grpop_test"
-	@echo "Waiting for Redis..."
-	@until docker exec gourdian-redis redis-cli -a redis_password ping 2>/dev/null | grep -q PONG; do sleep 1; done
-	@echo "Waiting for Mongo (auth + replica set)..."
-	@until docker exec gourdian-mongo-auth mongosh --quiet -u root -p mongo_password --authenticationDatabase admin --eval 'db.runCommand({ping:1})' >/dev/null 2>&1; do sleep 1; done
-	@docker exec gourdian-mongo-auth mongosh --quiet -u root -p mongo_password --authenticationDatabase admin --eval 'rs.initiate()' >/dev/null 2>&1 || true
 	@echo "Waiting for Mailpit..."
 	@until curl -sf http://localhost:8025/api/v1/info >/dev/null 2>&1; do sleep 1; done
-	@echo "Docker test infrastructure ready (postgres/redis/mongo-auth/mailpit)"
+	@echo "Docker test infrastructure ready (mailpit)"
 
 docker-down:
-	@docker stop gourdian-postgres gourdian-redis gourdian-mongo-auth gourdian-mailpit 2>/dev/null || true
-	@echo "Stopped (containers preserved for a fast restart via 'make docker-up')"
+	@docker stop gourdian-mailpit 2>/dev/null || true
+	@echo "Stopped (container preserved for a fast restart via 'make docker-up')"
 
 # precommit is the standard local gate before every commit: format, then
 # every static/dynamic check a CI run would also do, in cheapest-first
 # order so a fast failure (fmt/vet/lint) doesn't wait on the slow ones
-# (race, which spins up real Postgres/Redis/Mongo/Mailpit backend tests).
+# (race, which runs the Mailpit integration test).
 precommit: fmt vet lint race coverage-check
 	@echo "precommit checks passed"
 

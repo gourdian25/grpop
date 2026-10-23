@@ -29,14 +29,14 @@ var _ EmailSender = (*dryRunEmailSender)(nil)
 // staging log for however long retention lasts.
 //
 // A construction-time swap (pick this instead of NewSMTPDispatcher when
-// building a staging ServiceDeps), not a runtime toggle inside the real
+// wiring a staging sender), not a runtime toggle inside the real
 // dispatcher — kept deliberately simple.
 //
 // Distinct from MemoryEmailSender (memory.go): that one exists for
 // contract/unit tests and deliberately DOES record full sends for
 // assertion (test-only, never wired into a shared log sink); this one
 // exists for a staging/pre-prod deployment that should never actually
-// deliver mail but should otherwise exercise the real Service pipeline.
+// deliver mail but should otherwise exercise the caller's real pipeline.
 func NewDryRunEmailSender(logger Logger) EmailSender {
 	return &dryRunEmailSender{logger: OrNop(logger)}
 }

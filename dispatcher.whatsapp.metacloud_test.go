@@ -212,8 +212,8 @@ func TestMetaCloudDispatcher_Send_TemplateValidatorPassesThroughToVendorCall(t *
 
 func TestMetaCloudDispatcher_Send_RateLimiterBlocksBeforeVendorCall(t *testing.T) {
 	client := &fakeWhatsAppCloudAPIClient{}
-	limiter := &fakeChannelRateLimiter{waitErr: ErrRateLimited}
-	sender, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{Client: client, RateLimiter: limiter})
+	limiter := &fakeRateLimiter{refuse: true}
+	sender, err := NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps{Client: client, RecipientRateLimiter: limiter})
 	if err != nil {
 		t.Fatalf("NewMetaCloudWhatsAppDispatcher: %v", err)
 	}
