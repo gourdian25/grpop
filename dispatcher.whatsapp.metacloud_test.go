@@ -5,6 +5,7 @@ package grpop
 import (
 	"context"
 	"errors"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +24,7 @@ type fakeWhatsAppCloudAPIClient struct {
 
 	templates    []WhatsAppTemplateInfo
 	templatesErr error
+	listCalls    int
 }
 
 func (c *fakeWhatsAppCloudAPIClient) SendTemplateMessage(_ context.Context, req WhatsAppCloudAPIRequest) (WhatsAppCloudAPIResponse, error) {
@@ -39,10 +41,24 @@ func (c *fakeWhatsAppCloudAPIClient) SendTemplateMessage(_ context.Context, req 
 func (c *fakeWhatsAppCloudAPIClient) GetApprovedTemplates(_ context.Context) ([]WhatsAppTemplateInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.listCalls++
 	if c.templatesErr != nil {
 		return nil, c.templatesErr
 	}
 	return c.templates, nil
+}
+
+// setTemplates replaces what the next listing returns.
+func (c *fakeWhatsAppCloudAPIClient) setTemplates(templates []WhatsAppTemplateInfo, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.templates, c.templatesErr = templates, err
+}
+
+func (c *fakeWhatsAppCloudAPIClient) listings() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.listCalls
 }
 
 func (c *fakeWhatsAppCloudAPIClient) calls() int {
@@ -253,12 +269,20 @@ func TestMetaCloudDispatcher_Send_CircuitBreakerOpensAfterFailure(t *testing.T) 
 	}
 }
 
-func TestCountTemplateParameters(t *testing.T) {
-	if got := countTemplateParameters("Hello {{1}}, your order {{2}} shipped"); got != 2 {
-		t.Fatalf("countTemplateParameters = %d, want 2", got)
+// TestTemplatePlaceholders: every placeholder once, in order, positional or
+// named, with no cap on the number ({{25}}); anything else in braces isn't
+// one.
+func TestTemplatePlaceholders(t *testing.T) {
+	cases := map[string][]string{
+		"Hello {{1}}, your order {{2}} shipped; {{1}} again":    {"1", "2"},
+		"{{1}} {{2}} {{3}} {{4}} {{5}} {{25}}":                  {"1", "2", "3", "4", "5", "25"},
+		"Hi {{first_name}}, {{ order_id }} is {{first_name}}'s": {"first_name", "order_id"},
+		"no placeholders here, {not one}, {{ }}, {{a-b}}":       nil,
 	}
-	if got := countTemplateParameters("no placeholders here"); got != 0 {
-		t.Fatalf("countTemplateParameters = %d, want 0", got)
+	for text, want := range cases {
+		if got := templatePlaceholders(text); !slices.Equal(got, want) {
+			t.Errorf("templatePlaceholders(%q) = %q, want %q", text, got, want)
+		}
 	}
 }
 

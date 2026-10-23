@@ -69,6 +69,15 @@ local emulator. The dispatcher's rate-limit and breaker wiring is tested
 against a fake `WhatsAppCloudAPIClient`, and the real HTTP client against an
 `httptest.Server` (`dispatcher.whatsapp.metacloud_http_test.go`).
 
+Two live tests run only with real credentials, and skip otherwise:
+- `TestResendDispatcher_Live` needs `GRPOP_TEST_RESEND_API_KEY`;
+- `TestMetaCloud_Live` sends Meta's `hello_world` and needs
+  `GRPOP_TEST_META_PHONE_NUMBER_ID`, `GRPOP_TEST_META_ACCESS_TOKEN` and
+  `GRPOP_TEST_META_TO`. With `GRPOP_TEST_META_BUSINESS_ACCOUNT_ID` set too,
+  it also lists the templates and validates the send.
+
+Both run before a release tag.
+
 ## Architecture
 
 - **A sender** (`EmailSender`, `WhatsAppSender`) validates the message,
@@ -129,9 +138,17 @@ against a fake `WhatsAppCloudAPIClient`, and the real HTTP client against an
   `defaultMetaGraphAPIVersion`, `v26.0`; Meta retires a version about two
   years after release, so bump the default before it does). Sends use
   `PhoneNumberID`, while template listing for
-  `TemplateValidator` needs the separate `BusinessAccountID`.
-  `TemplateValidator`'s TTL cache is advisory. It can let a since-revoked
-  template through, but it never blocks a send Meta would accept, and a passing
+  `TemplateValidator` needs the separate `BusinessAccountID`; one client
+  from `NewMetaCloudAPIClient` serves both (IDs are digits only). The
+  listing asks for `status=APPROVED`, filters again itself, and pages by
+  Meta's cursor on the client's own host: it never fetches the `paging.next`
+  URL, so the token goes nowhere else. A repeated cursor or more than
+  `metaTemplateMaxPages` pages is an error.
+  `TemplateValidator` is advisory: a failed listing checks against the last
+  list or lets the send through; a refusal gets one more listing first (at
+  most one listing per `templateListMinInterval`, 30s, outside the TTL). Meta
+  lists a created one-time-code button as a `URL` (an `otp{{1}}` url, an
+  `otp_type`), so an OTP button must fit a listed URL button. A passing
   check never skips the real call. grpop never rotates a Meta access token.
 
 ## Conventions

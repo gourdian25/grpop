@@ -103,4 +103,9 @@
 // template between grpop's last cache refresh and a live send. The
 // underlying vendor call remains the ultimate source of truth: a passed
 // TemplateValidator check never causes Send to skip actually calling Meta.
+// A failed listing never blocks a send: the validator checks against the
+// last list it had, or lets the send through when it has none. A refusal
+// is checked once more against a new listing first, but at most one
+// listing per 30 seconds, so a template approved or edited within that
+// window can still be refused, by a permanent error.
 package grpop

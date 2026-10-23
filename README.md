@@ -219,6 +219,44 @@ recipients, and many callers aiming at one. A refused send returns
 |---|---|
 | Meta-backed, TTL-cached | `NewMetaTemplateValidator(MetaTemplateValidatorDeps)` |
 
+**WhatsAppCloudAPIClient** (the Graph API client both use)
+
+| Variant | Constructor |
+|---|---|
+| Meta's Graph API, `net/http` | `NewMetaCloudAPIClient(MetaCloudAPIClientConfig)` |
+
+To check templates before sending, build the client once and give it to
+both:
+
+```go
+client, err := grpop.NewMetaCloudAPIClient(grpop.MetaCloudAPIClientConfig{
+    PhoneNumberID:     os.Getenv("META_PHONE_NUMBER_ID"),     // to send
+    BusinessAccountID: os.Getenv("META_BUSINESS_ACCOUNT_ID"), // to list templates
+    AccessToken:       os.Getenv("META_ACCESS_TOKEN"),
+})
+validator, err := grpop.NewMetaTemplateValidator(grpop.MetaTemplateValidatorDeps{Client: client})
+sender, err := grpop.NewMetaCloudWhatsAppDispatcher(grpop.MetaCloudDispatcherDeps{
+    Client:            client,
+    TemplateValidator: validator,
+})
+```
+
+The validator lists the account's approved templates, every page, and keeps
+the list for its TTL (5 minutes). For each send it checks that the
+template is approved in that language and that the message fills what the
+template takes:
+- the header: text, media of the right kind, or a location;
+- the body: its count of values, or its names;
+- the buttons: each button that requires a value has one.
+
+A misfit is `ErrWhatsAppTemplateArityMismatch` saying what differs. The
+validator is advisory, and Meta decides:
+- when a listing fails, it checks against the last list it had, or lets the
+  send through when it has none;
+- a refusal is checked once more against a new listing (at most one listing
+  per 30 seconds), so a template approved a moment ago isn't refused for
+  long.
+
 **Helpers:** `FullJitterBackoff(base, max, attempt)` for a caller's retry
 loop.
 
@@ -292,6 +330,11 @@ names the field, never the value. Display names are fine
   authority: a message that passes can still be refused (an unknown
   template, a wrong count of values), and a rule Meta adds later is only
   Meta's refusal until grpop learns it.
+- **`TemplateValidator` is advisory, with a 30-second window both ways.** A
+  since-revoked template can look approved until the next listing (Meta
+  then refuses the send). A template approved or edited in the last 30
+  seconds can be refused by a permanent error, since a refusal gets at most
+  one new listing per 30 seconds. A failed listing never blocks a send.
 - **grpop never refreshes or rotates a Meta access token.** Token lifecycle
   is entirely the operator's responsibility.
 - **Meta retires a Graph API version about two years after release.**
@@ -310,7 +353,12 @@ skips when Mailpit is down, which drops coverage below the 95% gate). The
 Resend sender is tested against a local fake of its API; one live test sends
 to Resend's `delivered@resend.dev` only when `GRPOP_TEST_RESEND_API_KEY` is
 set (`GRPOP_TEST_RESEND_FROM` picks the sender, default
-`onboarding@resend.dev`):
+`onboarding@resend.dev`). The WhatsApp sender, the listing and the validator
+are tested against local fakes of Meta's API. One live test sends Meta's
+`hello_world` sample template only when `GRPOP_TEST_META_PHONE_NUMBER_ID`,
+`GRPOP_TEST_META_ACCESS_TOKEN` and `GRPOP_TEST_META_TO` (a number the account
+may message) are set. With `GRPOP_TEST_META_BUSINESS_ACCOUNT_ID` set as well,
+it first lists the account's templates and validates the send.
 
 ```sh
 make docker-up   # Mailpit

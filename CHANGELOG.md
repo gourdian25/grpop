@@ -23,11 +23,17 @@ backend to `mongo-driver/v2`; that backend is now removed.
   constructors `WhatsAppText`, `WhatsAppNamedText`, `WhatsAppImage`,
   `WhatsAppVideo`, `WhatsAppDocument` and `WhatsAppOTP`.
 - `ErrInvalidPhoneNumber` and `ErrWhatsAppParameterInvalid`, both permanent.
+- `NewMetaCloudAPIClient(MetaCloudAPIClientConfig)`: the real Graph API
+  client, exported so one client serves a sender and a `TemplateValidator`
+  (before, a caller had no way to build a validator against Meta).
+- `WhatsAppTemplateInfo.Named`, `HeaderFormat`, `HeaderParameters`,
+  `BodyParameters` and `Buttons` (`WhatsAppTemplateButton`).
 
 ### Removed
 
 - `WhatsAppMessage.TemplateVariables` and
   `WhatsAppCloudAPIRequest.TemplateVariables`: `Body` replaces them.
+- `WhatsAppTemplateInfo.ParameterCount`: `BodyParameters` replaces it.
 - `Service`, `NewService`, `ServiceDeps`, `ServiceConfig`,
   `DefaultServiceConfig`, `SendOptions` and `SendResult.Duplicate`.
 - `IdempotencyStore` and `NewCacheIdempotencyStore`.
@@ -84,6 +90,17 @@ backend to `mongo-driver/v2`; that backend is now removed.
   is checked against Meta's send-time rules before the call.
 - **`TemplateValidator.Validate(ctx, msg WhatsAppMessage)`** takes the
   message (was name, language and the variables map).
+- **The template validator is usable and keeps its promise:**
+  - the listing reads every page (it read one, so a template past it read
+    as unapproved), asks for `status=APPROVED`, and never sends the token
+    to a `paging.next` URL;
+  - placeholders are counted without the `{{20}}` cap, named ones included;
+  - a message is checked against the header, body and buttons
+    (`ErrWhatsAppTemplateArityMismatch` now says what differs);
+  - a failed listing no longer blocks sends: the last list is used, or the
+    send goes through;
+  - a refusal is checked against one new listing first (at most one per 30
+    seconds).
 - **The circuit breaker counts only temporary failures**, in every sender:
   a permanent one is recorded as the vendor answering, so a run of bad
   addresses no longer opens it. The SMTP sender classes a `5xx` inside the

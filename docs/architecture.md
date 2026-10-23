@@ -70,7 +70,7 @@ exists). See `docs.go`'s package-level doc comment.
 | `CircuitBreaker` | `standardCircuitBreaker` — the one implementation, returned as the interface type |
 | `EmailTemplateEngine` | `defaultEmailTemplateEngine` (`html/template` + `text/template`) |
 | `TemplateValidator` | `metaTemplateValidator` — TTL-cached over `WhatsAppCloudAPIClient.GetApprovedTemplates` |
-| `WhatsAppCloudAPIClient` | `metaCloudAPIClient` (real, `net/http`); fake in tests — Meta's Graph API has no local emulator (§5) |
+| `WhatsAppCloudAPIClient` | `metaCloudAPIClient` (real, `net/http`, `NewMetaCloudAPIClient`; one serves a sender and a validator); fake in tests — Meta's Graph API has no local emulator (§5) |
 
 ## 3. Key design decisions
 
@@ -203,23 +203,45 @@ authentication templates require. `WhatsAppOTP` builds that pair.
 rules refuse (read 2026-10-24). The tests pin the exact JSON of every kind
 against an `httptest` server.
 
-### 3.8 `TemplateValidator`: advisory, TTL-cached, never a false negative
+### 3.8 `TemplateValidator`: advisory, TTL-cached, a short false-negative window
 
-Meta requires every WhatsApp template to go through approval before use;
-`TemplateValidator.Validate` checks both approval status and that
-`WhatsAppMessage.Body`'s length matches the approved template's expected
-parameter count (`WhatsAppTemplateInfo.ParameterCount`, parsed from the
-approved template body's `{{1}}`, `{{2}}`, ... placeholder count) —
-catching the two most common vendor-rejection causes before a live send is
-attempted. The cache (default 5 minute TTL, refreshed lazily on a stale
-`Validate` call or eagerly via `Refresh`) means "approved as of the last
-check," not a live guarantee — Meta can approve, reject, or delete a
-template between grpop's last refresh and a live send. This is accepted
-because the vendor call itself remains the ultimate source of truth: a
-passed `Validate` check never causes `Send` to skip actually calling Meta,
-so the cache can only ever produce a false *positive* window (a
-since-revoked template briefly still looks approved), never a false
-negative that blocks a send that would have succeeded.
+Meta requires every WhatsApp template to go through approval before use.
+`TemplateValidator.Validate` checks that the template is approved in the
+message's language, and that the message fills what it takes
+(`WhatsAppTemplateInfo`, read from Meta's listing):
+- a text header's placeholder, by name in a named template; media of the
+  header's kind; a location;
+- the body's placeholders, by count or by name (counted with a regexp, so
+  `{{25}}` and `{{first_name}}` count; until 0.2.0 counting stopped at
+  `{{20}}` and missed names);
+- every button that requires a value (a URL with a placeholder, a coupon, a
+  one-time code). Meta lists a created one-time-code button as a `URL`, so
+  an OTP button fits one.
+
+That catches the commonest refusals before a live send.
+
+**The listing** pages by Meta's cursor to the end (until 0.2.0 it read one
+page, so a template past it read as unapproved). It asks for
+`status=APPROVED` and filters again itself. It never fetches the
+`paging.next` URL: the access token goes only to the configured host. A
+repeated cursor, or more than 100 pages of 100, is an error rather than a
+cut-off list.
+
+**The cache** (default 5 minute TTL, refreshed lazily on a stale `Validate`
+call or eagerly via `Refresh`) means "approved as of the last check," not a
+live guarantee. The validator stays advisory, and Meta is the authority:
+- a failed listing never blocks a send (until 0.2.0 it did): it checks
+  against the last list it had, or lets the send through when it has none;
+- after a failure it lists again only after 30 seconds, so a Meta outage
+  costs one listing per 30 seconds, not one per send;
+- a refusal is checked once more against a new listing before it is
+  returned, at most one listing per 30 seconds.
+
+So a since-revoked template can briefly look approved (a false positive,
+and Meta's own refusal follows). A template approved or edited in the last
+30 seconds can be refused (a false negative). That window is the cost of
+not listing on every refusal, and a passed check never skips the call to
+Meta.
 
 ### 3.9 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
 

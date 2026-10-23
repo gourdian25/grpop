@@ -13,8 +13,8 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 | P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | **Done** 2026-10-23 |
 | P4 | The Resend sender over `net/http` (no SDK) | **Done** 2026-10-24 |
 | P5 | WhatsApp messages: typed components (header, body, buttons; named or positional), the OTP helper, phone and value checks, and the breaker counting only temporary failures | **Done** 2026-10-24 |
-| P6 | The template validator, usable and truthful: an exported Meta client, paginated listing, component-aware counts, advisory when the listing fails; a live Meta smoke test | **Next** |
-| *grsentry* | M1a–M1d on this untagged grpop: `../go.work` in workspace mode, a pseudo-version of a pushed `master` commit for `GOWORK=off` and CI. A change M1 needs here becomes a stage of its own | To do |
+| P6 | The template validator, usable and truthful: an exported Meta client, paginated listing, component-aware counts, advisory when the listing fails; a live Meta smoke test | **Done** 2026-10-24 (live test unrun: needs the user's Meta keys) |
+| *grsentry* | M1a–M1d on this untagged grpop: `../go.work` in workspace mode, a pseudo-version of a pushed `master` commit for `GOWORK=off` and CI. A change M1 needs here becomes a stage of its own | **Next** (the user pushes grpop's `master` first) |
 | P7 | Release `v0.2.0` once grsentry runs on it and grpop needs nothing more: the CHANGELOG dated, `make prerelease`, the user tags; grsentry moves from the pseudo-version to the tag | To do, last |
 
 ## The decisions (the user's, 2026-10-23)
@@ -246,7 +246,62 @@ The plan as written before the stage:
   - a permanent failure counted by the breaker;
   - named and positional values mixed.
 
-## P6: the template validator, usable and truthful (next)
+## P6: the template validator, usable and truthful (done)
+
+**Built 2026-10-24.**
+
+**Meta's listing, re-read first.**
+- The new reference (`reference/whatsapp-business-account/message-template-api`) documents only `fields`, `limit`, `after` and `before` for the listing.
+- The Graph API reference documents `status` as a filter, so grpop asks for `status=APPROVED` and still filters itself.
+- Paging is `paging.cursors.after` plus `paging.next`.
+
+**Five departures, each stricter or forced by what Meta lists:**
+- **The cursor, never the `next` URL.** grpop asks for the next page itself, by the cursor, on the client's own host. Following `paging.next` would send the access token to whatever host the response named. A repeated cursor, or more than 100 pages of 100, is an error rather than a cut-off list.
+- **IDs are digits only.** `NewMetaCloudAPIClient` refuses a `PhoneNumberID` or `BusinessAccountID` that isn't, so an ID can't add path segments to a URL carrying the token. A send without a `PhoneNumberID` is a permanent error.
+- **A one-time code fits a listed `URL` button.** Meta lists a created authentication button as a `URL` button whose url ends `otp{{1}}`, sometimes with its `otp_type`. Its copy-code page says so, and two published listing examples agree. So:
+  - a `URL` button with a placeholder or an `otp_type` requires a value;
+  - P5's OTP button and a URL suffix both fit a `URL` or `OTP` button.
+
+  Without this, the validator would refuse every one-time code.
+- **A refusal gets one more look.** The validator lists again before returning a refusal, at most one listing per 30 seconds. A failed listing likewise waits 30 seconds before the next attempt, so a Meta outage costs one listing per 30 seconds, not one per send.
+
+  The validator's claim is now precise: a template approved or edited in the last 30 seconds can be refused, and a since-revoked one can briefly pass. The old claim, "never blocks a send Meta would accept", was false three ways:
+  - one page of templates;
+  - the `{{20}}` cap;
+  - a failed listing failing the send.
+- **`WhatsAppTemplateInfo`'s new shape:**
+  - `Named`;
+  - `HeaderFormat`;
+  - `HeaderParameters` and `BodyParameters`: the placeholders in order;
+  - `Buttons []WhatsAppTemplateButton{Index, Type, RequiresValue}`.
+
+  It replaces `ParameterCount`. A template with no `parameter_format` (older than named parameters) counts as named when any placeholder isn't a number. A header format grpop doesn't know (a GIF) isn't checked.
+
+**Checked:**
+- the gate: gofmt, build and vet both ways, `GOWORK=off go mod tidy -diff`, `bark check`;
+- `make precommit`: lint 0 issues, `-race`, coverage 97.5%, with a throwaway Mailpit removed with `docker rm -f -v`. The only skips were the two live tests;
+- mutants, on copies, each built first, with a control that passes: 12 of 12 caught:
+  - the listing stopping at page one;
+  - the `{{20}}` cap back;
+  - named placeholders uncounted;
+  - a failed listing blocking the send;
+  - the status filter dropped both ways;
+  - a refusal not looked at again;
+  - a failed listing retried on every send;
+  - an OTP refused on a listed URL button;
+  - a required button left unchecked;
+  - the named set unchecked;
+  - a repeated cursor undetected;
+  - `otp_type` ignored.
+
+**`TestMetaCloud_Live` has not run**, so Meta's acceptance of the request and of the listing is unproven until you run it with your keys:
+- `GRPOP_TEST_META_PHONE_NUMBER_ID`, `GRPOP_TEST_META_ACCESS_TOKEN` and `GRPOP_TEST_META_TO`;
+- `GRPOP_TEST_META_BUSINESS_ACCOUNT_ID` to test the listing as well.
+
+It must run before P7, and so must the Resend one.
+
+The plan as written before the stage:
+
 
 - **An exported client:** `NewMetaCloudAPIClient(MetaCloudAPIClientConfig{PhoneNumberID, BusinessAccountID, AccessToken, GraphAPIVersion, Timeout})`. The dispatcher uses it when `Client` is nil, and a caller hands the same client to `NewMetaTemplateValidator`.
 - **The listing:**

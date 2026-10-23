@@ -310,12 +310,42 @@ type CircuitBreakerStats struct {
 	TimeUntilNextAttempt time.Duration
 }
 
-// WhatsAppTemplateInfo describes one Meta-approved template, as returned
-// by a WhatsApp dispatcher's vendor-narrow client.
+// WhatsAppTemplateInfo describes one Meta-approved template: what each part
+// of it takes at send time, read from Meta's template listing
+// (WhatsAppCloudAPIClient.GetApprovedTemplates), so TemplateValidator can
+// check a WhatsAppMessage's Header, Body and Buttons against it.
 type WhatsAppTemplateInfo struct {
-	Name           string
-	LanguageCode   string
-	ParameterCount int // number of positional placeholders ({{1}}, {{2}}, ...) the approved
-	// template body actually expects, so TemplateValidator.Validate can
-	// compare it with len(WhatsAppMessage.Body), not just approval status
+	Name         string
+	LanguageCode string
+
+	// Named is a template whose placeholders are names ({{first_name}},
+	// Meta's NAMED parameter format); otherwise they are positional
+	// ({{1}}, {{2}}, ...).
+	Named bool
+
+	// HeaderFormat is Meta's header format: "TEXT", "IMAGE", "VIDEO",
+	// "DOCUMENT" or "LOCATION" ("" for no header). A media or location
+	// header takes its value at every send; a text one only when it has a
+	// placeholder.
+	HeaderFormat string
+
+	// HeaderParameters and BodyParameters are the placeholders of a text
+	// header and of the body, each once, in order of first appearance:
+	// "1", "2", ... or the names.
+	HeaderParameters []string
+	BodyParameters   []string
+
+	// Buttons are the template's buttons, in order.
+	Buttons []WhatsAppTemplateButton
+}
+
+// WhatsAppTemplateButton is one button of an approved template.
+type WhatsAppTemplateButton struct {
+	Index int    // its position among the template's buttons
+	Type  string // Meta's button type: "URL", "QUICK_REPLY", "COPY_CODE", "OTP", "PHONE_NUMBER", ...
+	// RequiresValue is a button every send must fill: a URL with a
+	// placeholder (a one-time code's button is one: Meta lists a created
+	// authentication button as a URL), a coupon code, a one-time code. A
+	// quick reply's payload is optional.
+	RequiresValue bool
 }

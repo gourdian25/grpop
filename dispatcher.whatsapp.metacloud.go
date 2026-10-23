@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
@@ -110,7 +111,9 @@ type MetaCloudDispatcherDeps struct {
 	GraphAPIVersion string
 
 	// Client is optional; nil constructs a real net/http-backed one from
-	// PhoneNumberID/BusinessAccountID/AccessToken/RequestTimeout.
+	// PhoneNumberID/BusinessAccountID/AccessToken/RequestTimeout. To check
+	// templates too, build the client once with NewMetaCloudAPIClient and
+	// pass it here and as MetaTemplateValidatorDeps.Client.
 	Client            WhatsAppCloudAPIClient
 	TemplateValidator TemplateValidator
 	// RateLimiter bounds the whole channel and RecipientRateLimiter each
@@ -146,7 +149,7 @@ var _ WhatsAppSender = (*metaCloudDispatcher)(nil)
 // Returns:
 //   - WhatsAppSender
 //   - error: non-nil if deps.Client is nil and PhoneNumberID/AccessToken
-//     are not both set
+//     are not both set, or NewMetaCloudAPIClient refuses them
 func NewMetaCloudWhatsAppDispatcher(deps MetaCloudDispatcherDeps) (WhatsAppSender, error) {
 	client := deps.Client
 	if client == nil {
@@ -156,18 +159,17 @@ func NewMetaCloudWhatsAppDispatcher(deps MetaCloudDispatcherDeps) (WhatsAppSende
 		if deps.AccessToken == "" {
 			return nil, errors.New("grpop/metacloud: MetaCloudDispatcherDeps.AccessToken is required")
 		}
-		timeout := deps.RequestTimeout
-		if timeout <= 0 {
-			timeout = 10 * time.Second
+		var err error
+		client, err = NewMetaCloudAPIClient(MetaCloudAPIClientConfig{
+			PhoneNumberID:     deps.PhoneNumberID,
+			BusinessAccountID: deps.BusinessAccountID,
+			AccessToken:       deps.AccessToken,
+			GraphAPIVersion:   deps.GraphAPIVersion,
+			Timeout:           deps.RequestTimeout,
+		})
+		if err != nil {
+			return nil, err
 		}
-		version := deps.GraphAPIVersion
-		if version == "" {
-			version = defaultMetaGraphAPIVersion
-		}
-		if !metaGraphAPIVersionPattern.MatchString(version) {
-			return nil, fmt.Errorf("grpop/metacloud: GraphAPIVersion %q is not a Graph API version like v26.0", version)
-		}
-		client = newRealWhatsAppCloudAPIClient(deps.PhoneNumberID, deps.BusinessAccountID, deps.AccessToken, version, timeout)
 	}
 
 	return &metaCloudDispatcher{
@@ -267,15 +269,71 @@ type metaCloudAPIClient struct {
 
 var _ WhatsAppCloudAPIClient = (*metaCloudAPIClient)(nil)
 
-func newRealWhatsAppCloudAPIClient(phoneNumberID, businessAccountID, accessToken, apiVersion string, timeout time.Duration) *metaCloudAPIClient {
+// metaIDPattern is a Graph API object ID (a phone number ID, a business
+// account ID): digits only, so an ID can't add path segments of its own to
+// a URL that carries the access token.
+var metaIDPattern = regexp.MustCompile(`^[0-9]+$`)
+
+// MetaCloudAPIClientConfig configures NewMetaCloudAPIClient.
+type MetaCloudAPIClientConfig struct {
+	// PhoneNumberID is the sending number's ID, needed to send.
+	PhoneNumberID string
+	// BusinessAccountID is the WhatsApp Business Account's ID, needed to
+	// list its templates (GetApprovedTemplates, for a TemplateValidator).
+	BusinessAccountID string
+	// AccessToken is required; grpop never refreshes or rotates it.
+	AccessToken string
+	// GraphAPIVersion defaults to defaultMetaGraphAPIVersion.
+	GraphAPIVersion string
+	// Timeout bounds one Graph API call (each page of a listing is one).
+	// Default: 10s.
+	Timeout time.Duration
+}
+
+// NewMetaCloudAPIClient constructs the real WhatsAppCloudAPIClient over
+// Meta's Graph API. One client serves both a WhatsApp sender
+// (MetaCloudDispatcherDeps.Client) and a TemplateValidator
+// (MetaTemplateValidatorDeps.Client).
+//
+// Parameters:
+//   - cfg: MetaCloudAPIClientConfig — AccessToken and at least one of
+//     PhoneNumberID or BusinessAccountID are required
+//
+// Returns:
+//   - WhatsAppCloudAPIClient
+//   - error: non-nil if AccessToken is empty, both IDs are empty, an ID
+//     isn't digits only, or GraphAPIVersion isn't like v26.0
+func NewMetaCloudAPIClient(cfg MetaCloudAPIClientConfig) (WhatsAppCloudAPIClient, error) {
+	if cfg.AccessToken == "" {
+		return nil, errors.New("grpop/metacloud: MetaCloudAPIClientConfig.AccessToken is required")
+	}
+	if cfg.PhoneNumberID == "" && cfg.BusinessAccountID == "" {
+		return nil, errors.New("grpop/metacloud: MetaCloudAPIClientConfig needs a PhoneNumberID (to send) or a BusinessAccountID (to list templates)")
+	}
+	for _, id := range []struct{ name, value string }{{"PhoneNumberID", cfg.PhoneNumberID}, {"BusinessAccountID", cfg.BusinessAccountID}} {
+		if id.value != "" && !metaIDPattern.MatchString(id.value) {
+			return nil, fmt.Errorf("grpop/metacloud: MetaCloudAPIClientConfig.%s is not a Graph API ID (digits only)", id.name)
+		}
+	}
+	version := cfg.GraphAPIVersion
+	if version == "" {
+		version = defaultMetaGraphAPIVersion
+	}
+	if !metaGraphAPIVersionPattern.MatchString(version) {
+		return nil, fmt.Errorf("grpop/metacloud: GraphAPIVersion %q is not a Graph API version like v26.0", version)
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	return &metaCloudAPIClient{
 		httpClient:        &http.Client{Timeout: timeout},
-		phoneNumberID:     phoneNumberID,
-		businessAccountID: businessAccountID,
-		accessToken:       accessToken,
-		apiVersion:        apiVersion,
+		phoneNumberID:     cfg.PhoneNumberID,
+		businessAccountID: cfg.BusinessAccountID,
+		accessToken:       cfg.AccessToken,
+		apiVersion:        version,
 		baseURL:           metaGraphAPIBaseURL,
-	}
+	}, nil
 }
 
 type metaLanguage struct {
@@ -372,8 +430,11 @@ func (c *metaCloudAPIClient) SendTemplateMessage(ctx context.Context, req WhatsA
 		},
 	}
 
-	url := fmt.Sprintf("%s/%s/%s/messages", c.baseURL, c.apiVersion, c.phoneNumberID)
-	respBody, err := c.doJSON(ctx, http.MethodPost, url, body)
+	if c.phoneNumberID == "" {
+		return WhatsAppCloudAPIResponse{}, permanent(errors.New("grpop/metacloud: a PhoneNumberID is required to send"))
+	}
+	endpoint := fmt.Sprintf("%s/%s/%s/messages", c.baseURL, c.apiVersion, c.phoneNumberID)
+	respBody, err := c.doJSON(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return WhatsAppCloudAPIResponse{}, err
 	}
@@ -468,64 +529,149 @@ func metaButton(b WhatsAppButton) metaTemplateComponent {
 	return component
 }
 
+// The template listing reads metaTemplatePageSize templates a page, at most
+// metaTemplateMaxPages pages: 10,000 templates, past the 6,000 Meta lets
+// even a verified business keep, so a longer listing means something is
+// wrong and is an error rather than a cut-off list.
+const (
+	metaTemplatePageSize = 100
+	metaTemplateMaxPages = 100
+)
+
+// metaTemplatePlaceholder is a template text's placeholder: {{1}} in a
+// positional template, {{first_name}} in a named one, spaces inside the
+// braces tolerated.
+var metaTemplatePlaceholder = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_]+)\s*\}\}`)
+
 type metaTemplateListResponse struct {
-	Data []struct {
-		Name       string `json:"name"`
-		Language   string `json:"language"`
-		Status     string `json:"status"`
-		Components []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"components"`
-	} `json:"data"`
+	Data   []metaTemplate `json:"data"`
+	Paging struct {
+		Cursors struct {
+			After string `json:"after"`
+		} `json:"cursors"`
+		Next string `json:"next"`
+	} `json:"paging"`
 }
 
+type metaTemplate struct {
+	Name            string `json:"name"`
+	Language        string `json:"language"`
+	Status          string `json:"status"`
+	ParameterFormat string `json:"parameter_format"`
+	Components      []struct {
+		Type    string `json:"type"`
+		Format  string `json:"format"`
+		Text    string `json:"text"`
+		Buttons []struct {
+			Type    string `json:"type"`
+			URL     string `json:"url"`
+			OTPType string `json:"otp_type"`
+		} `json:"buttons"`
+	} `json:"components"`
+}
+
+// GetApprovedTemplates lists the business account's approved templates,
+// every page of them. It asks Meta for status=APPROVED and still drops any
+// other status itself. A next page is asked for with the cursor Meta gave
+// (after=), on this client's own base URL: the paging.next URL Meta also
+// gives is never fetched, so the access token only ever goes to the
+// configured host. A listing that repeats a cursor or runs past
+// metaTemplateMaxPages pages is an error.
 func (c *metaCloudAPIClient) GetApprovedTemplates(ctx context.Context) ([]WhatsAppTemplateInfo, error) {
 	if c.businessAccountID == "" {
-		return nil, errors.New("grpop/metacloud: MetaCloudDispatcherDeps.BusinessAccountID is required to list approved templates")
+		return nil, errors.New("grpop/metacloud: a BusinessAccountID is required to list approved templates")
 	}
-	url := fmt.Sprintf("%s/%s/%s/message_templates?fields=name,language,status,components&limit=200",
-		c.baseURL, c.apiVersion, c.businessAccountID)
-	respBody, err := c.doJSON(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
+	query := url.Values{
+		"fields": {"name,language,status,parameter_format,components"},
+		"status": {"APPROVED"},
+		"limit":  {strconv.Itoa(metaTemplatePageSize)},
 	}
-
-	var parsed metaTemplateListResponse
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("grpop/metacloud: decode template list: %w", err)
-	}
-
-	out := make([]WhatsAppTemplateInfo, 0, len(parsed.Data))
-	for _, t := range parsed.Data {
-		if t.Status != "APPROVED" {
-			continue
+	var out []WhatsAppTemplateInfo
+	for page := 0; page < metaTemplateMaxPages; page++ {
+		endpoint := fmt.Sprintf("%s/%s/%s/message_templates?%s", c.baseURL, c.apiVersion, c.businessAccountID, query.Encode())
+		respBody, err := c.doJSON(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
 		}
-		paramCount := 0
-		for _, comp := range t.Components {
-			if comp.Type == "BODY" {
-				paramCount = countTemplateParameters(comp.Text)
+		var parsed metaTemplateListResponse
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			return nil, fmt.Errorf("grpop/metacloud: decode template list: %w", err)
+		}
+		for _, t := range parsed.Data {
+			if t.Status == "APPROVED" {
+				out = append(out, metaTemplateInfo(t))
 			}
 		}
-		out = append(out, WhatsAppTemplateInfo{Name: t.Name, LanguageCode: t.Language, ParameterCount: paramCount})
+
+		after := parsed.Paging.Cursors.After
+		if parsed.Paging.Next == "" || after == "" {
+			return out, nil
+		}
+		if after == query.Get("after") {
+			return nil, errors.New("grpop/metacloud: template list repeated a page cursor")
+		}
+		query.Set("after", after)
 	}
-	return out, nil
+	return nil, fmt.Errorf("grpop/metacloud: template list runs past %d pages", metaTemplateMaxPages)
 }
 
-// countTemplateParameters counts the highest positional placeholder
-// ("{{1}}", "{{2}}", ...) referenced in a template body's text, Meta's own
-// convention for how many parameters an approved template expects.
-func countTemplateParameters(bodyText string) int {
-	max := 0
-	for i := 1; i <= 20; i++ {
-		if strings.Contains(bodyText, "{{"+strconv.Itoa(i)+"}}") {
-			max = i
+// metaTemplateInfo reads what each part of t takes at send time. A template
+// without a parameter_format (one older than named parameters) is named
+// when any of its placeholders isn't a number.
+func metaTemplateInfo(t metaTemplate) WhatsAppTemplateInfo {
+	info := WhatsAppTemplateInfo{Name: t.Name, LanguageCode: t.Language}
+	for _, comp := range t.Components {
+		switch strings.ToUpper(comp.Type) {
+		case "HEADER":
+			info.HeaderFormat = strings.ToUpper(comp.Format)
+			if info.HeaderFormat == "TEXT" {
+				info.HeaderParameters = templatePlaceholders(comp.Text)
+			}
+		case "BODY":
+			info.BodyParameters = templatePlaceholders(comp.Text)
+		case "BUTTONS":
+			for i, b := range comp.Buttons {
+				kind := strings.ToUpper(b.Type)
+				info.Buttons = append(info.Buttons, WhatsAppTemplateButton{
+					Index: i,
+					Type:  kind,
+					// Meta lists a created one-time-code button as a URL
+					// (its url ending otp{{1}}, an otp_type kept), so
+					// either marks a URL that takes the code.
+					RequiresValue: kind == "COPY_CODE" || kind == "OTP" ||
+						(kind == "URL" && (metaTemplatePlaceholder.MatchString(b.URL) || b.OTPType != "")),
+				})
+			}
 		}
 	}
-	return max
+	switch strings.ToUpper(t.ParameterFormat) {
+	case "NAMED":
+		info.Named = true
+	case "":
+		for _, name := range append(append([]string(nil), info.HeaderParameters...), info.BodyParameters...) {
+			if strings.Trim(name, "0123456789") != "" {
+				info.Named = true
+			}
+		}
+	}
+	return info
 }
 
-func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, url string, payload any) ([]byte, error) {
+// templatePlaceholders is text's placeholders, each once, in order of first
+// appearance: "1", "2", ... or the names. Nothing caps a number.
+func templatePlaceholders(text string) []string {
+	var names []string
+	seen := make(map[string]bool)
+	for _, match := range metaTemplatePlaceholder.FindAllStringSubmatch(text, -1) {
+		if !seen[match[1]] {
+			seen[match[1]] = true
+			names = append(names, match[1])
+		}
+	}
+	return names
+}
+
+func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, endpoint string, payload any) ([]byte, error) {
 	var bodyReader io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -535,7 +681,7 @@ func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, url string, pay
 		bodyReader = bytes.NewReader(encoded)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	httpReq, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("grpop/metacloud: build request: %w", err)
 	}

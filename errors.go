@@ -76,8 +76,9 @@ var (
 
 	// ErrWhatsAppTemplateArityMismatch indicates TemplateValidator.Validate
 	// found an approved template matching name+language, but the message's
-	// Body values don't match its expected parameter count.
-	ErrWhatsAppTemplateArityMismatch = permanent(errors.New("grpop: whatsapp template variable count does not match the approved template's expected parameter count"))
+	// Header, Body or Buttons don't fill what it takes (a count, a name, a
+	// kind). The error says what differs, never a value.
+	ErrWhatsAppTemplateArityMismatch = permanent(errors.New("grpop: whatsapp message does not fit the approved template's parameters"))
 
 	// ErrInvalidPhoneNumber indicates a WhatsAppMessage.To that isn't a
 	// phone number in international form: an optional "+", a country code
