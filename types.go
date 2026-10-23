@@ -60,6 +60,15 @@ type EmailMessage struct {
 	TemplateName   string
 	InlineTemplate *EmailTemplate
 	TemplateData   map[string]any
+
+	// IdempotencyKey is optional: the same value on every attempt at one
+	// message (a grsentry outbox row's id, say), so a sender that can tell
+	// the vendor makes a retry safe. The SMTP sender derives the
+	// Message-ID from it (its SHA-256, so the key itself never appears in
+	// the message), which receiving systems may use to collapse a
+	// duplicate; it can do no more, since SMTP has no idempotency of its
+	// own. Two different messages must never share one.
+	IdempotencyKey string
 }
 
 // WhatsAppMessage is structurally different from EmailMessage on purpose:

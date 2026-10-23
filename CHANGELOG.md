@@ -14,7 +14,8 @@ backend to `mongo-driver/v2`; that backend is now removed.
 
 ### Added
 
-- `ErrPermanent`, `ErrInvalidAddress`, `MetaCloudDispatcherDeps.GraphAPIVersion`.
+- `ErrPermanent`, `ErrInvalidAddress`, `MetaCloudDispatcherDeps.GraphAPIVersion`,
+  `EmailMessage.IdempotencyKey`.
 
 ### Removed
 
@@ -56,6 +57,13 @@ backend to `mongo-driver/v2`; that backend is now removed.
   An invalid `SMTPDispatcherDeps.DefaultFrom` fails at construction.
 - **Logs:** the SMTP and dry-run senders log a recipient masked
   (`a***@example.com`), also inside an SMTP reply that echoes it.
+- **One email preparation step:** every email sender checks, renders and
+  parses a message the same way (`prepareEmail`), so a second email vendor
+  sends exactly what the SMTP sender would.
+- **`EmailMessage.IdempotencyKey`:** optional, the same on every attempt at
+  one message. The SMTP sender makes the `Message-ID` its SHA-256, so a
+  retried message carries the same `Message-ID`; without a key it stays
+  random.
 - **Meta Graph API version:** `MetaCloudDispatcherDeps.GraphAPIVersion`,
   default `v26.0`. The hard-coded `v20.0` stopped being served on
   2026-09-24.

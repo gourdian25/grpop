@@ -56,7 +56,9 @@
 // message the vendor already took. The SMTP sender can't be cancelled
 // mid-transaction either: on a timeout its goroutine is abandoned, not
 // stopped, and may still deliver. A caller that must not double-send needs
-// a vendor-side idempotency key.
+// a vendor-side idempotency key; EmailMessage.IdempotencyKey is where it
+// goes. The SMTP sender can only derive a stable Message-ID from it, which
+// receiving systems may or may not use to drop a duplicate.
 //
 // ErrPermanent separates a failure that will recur on every attempt (a
 // malformed or unrenderable message, an unparseable address, an SMTP 5xx

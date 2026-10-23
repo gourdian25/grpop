@@ -10,8 +10,8 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 |---|---|---|
 | P1 | Remove what isn't delivery: `Service`, the idempotency store, the DLQ (memory, Postgres, Mongo), `MessageEncryptor`, `Service`'s lifecycle events, and grpop's own rate limiters (`RateLimiter` becomes `grlimiter.Limiter`'s shape) | **Done** 2026-10-23 |
 | P2 | Fix what is left: one permanent-vs-temporary error check callers use, safe addresses, masked emails in logs, the Meta API version as config | **Done** 2026-10-23 |
-| P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | **Next** |
-| P4 | The Resend sender over `net/http` (no SDK) | To do |
+| P3 | One shared email preparation step (validate, render, addresses) for every email sender, and an optional idempotency key on `EmailMessage` | **Done** 2026-10-23 |
+| P4 | The Resend sender over `net/http` (no SDK) | **Next** |
 | P5 | Release `v0.2.0` | To do |
 | P6 | WhatsApp completion: header and media parameters, buttons (URL, copy-code), named parameters, Meta's current API version, a live smoke test | To do, after grsentry's M1 (M1 needs email only) |
 
@@ -102,11 +102,20 @@ grpop builds and vets against grcache `v0.6.0` (grsentry's), checked on a copy; 
 - **Mutants:** 11 of 11 caught, the control green: the 5xx rule dropped; the line-break check dropped; `Reply-To` unparsed; the mask bypassed; a sentinel not permanent; 130429 classed permanent; the default back at `v20.0`; a render error not permanent; the SMTP reply logged unredacted; every Meta 4xx temporary; `net/mail`'s message echoed in the error.
 - **Open, for the user:** the circuit breaker counts a permanent failure like any other, so a burst of `550`s for bad addresses could open it for every recipient. Counting only temporary failures would be a one-line change in each sender; not done without a decision.
 
-## P3: one email preparation step, and an idempotency key
+## P3: one email preparation step, and an idempotency key (done)
 
 - `resolveContent` is a method of the SMTP sender today. It becomes a package function, `prepareEmail(msg, defaultFrom, engine) (preparedEmail, error)`: validate the message, parse the addresses (P2), resolve exactly one content mode, apply the default sender. The SMTP sender uses it; the Resend sender (P4) will, so both send exactly the same message for the same input.
 - `EmailMessage.IdempotencyKey` (optional): the Resend sender sends it as `Idempotency-Key`. The SMTP sender derives the `Message-ID` from it (`<sha256-hex@domain>`), so a retried send carries the same `Message-ID`, which receiving systems may use to collapse a duplicate; without a key the `Message-ID` stays random.
 - **Tests:** the SMTP sender's behaviour is unchanged for every existing case; the same key gives the same `Message-ID`.
+
+*P3 as built (2026-10-23):*
+- **`dispatcher.email.go`** (new): `prepareEmail(msg, defaultFrom, engine) (preparedEmail, error)` checks the message, renders its one content mode (`renderEmailContent`, the SMTP sender's old `resolveContent` as a package function), applies the default sender and parses the three addresses; `preparedEmail` holds the parsed addresses, the rendered content and the key. The SMTP sender's `Send` now starts from it and reads no `EmailMessage` field itself.
+- **`EmailMessage.IdempotencyKey`** (optional). The SMTP sender's `smtpMessageID` makes the Message-ID the key's SHA-256 hex at the bare sender's domain (random without a key), so every attempt at one message carries the same Message-ID and the key itself never appears in the message.
+- **`example/`** gives each of its four messages a key.
+- **Docs:** README, `docs.go` (the at-least-once paragraph), `docs/architecture.md` (a new §3.4, sections renumbered), `CLAUDE.md`, the CHANGELOG.
+- **Tests:** `dispatcher.email_test.go` (new): a literal message with the default sender and its key, both template modes, nine refusals each permanent; SMTP: one key gives one Message-ID (the key's SHA-256), another key or none another, and the key never in the message. Every existing SMTP test passes unchanged.
+- **Gate:** all green: gofmt, build and vet (both ways), `go mod tidy -diff`, `make precommit` (lint 0 issues, `-race`, coverage 97.1%) with a throwaway Mailpit (no skips; removed `-v`), `bark check` (`bark tree` for the two new files). `go run ./example` sent all four, and Mailpit's Message-IDs were the keys' hashes.
+- **Mutants:** 8 of 8 caught, the control green: the key ignored; the raw key as the Message-ID; `prepareEmail` dropping the key; the default sender ignored; the Reply-To dropped; an inline template rendered as a registered one; validation skipped; the SMTP sender preparing something other than the message.
 
 ## P4: the Resend sender
 

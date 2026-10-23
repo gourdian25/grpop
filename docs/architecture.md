@@ -112,7 +112,20 @@ retry-later codes (read from its error reference, listed in
 refusal permanent. The circuit breaker still counts every failure, a
 permanent one included.
 
-### 3.4 Addresses are parsed, and logged masked
+### 3.4 One preparation step for every email sender
+
+`prepareEmail` (`dispatcher.email.go`, 0.2.0 P3) is the only path from an
+`EmailMessage` to what a vendor is sent: check it (`validateEmailMessage`),
+render its one content mode (`renderEmailContent`), apply the default
+sender, parse `From`, `To` and `Reply-To`. Every email sender builds its
+request from the `preparedEmail` it returns, so two vendors send the same
+message for the same input and refuse the same ones, with the same
+permanent errors. It also carries `EmailMessage.IdempotencyKey`: a vendor
+with idempotency gets it as is; the SMTP sender makes the `Message-ID` the
+key's SHA-256 at the sender's domain (`smtpMessageID`), the same on every
+attempt and never the key itself.
+
+### 3.5 Addresses are parsed, and logged masked
 
 `From`, `To` and `Reply-To` go through `net/mail.ParseAddress`
 (`parseEmailAddress`), and a CR or LF anywhere is refused first: written
@@ -124,14 +137,14 @@ rate-limit key the bare address, and a bad `DefaultFrom` fails at
 construction. Log lines carry `maskEmail`'s `a***@example.com`, and an SMTP
 reply that echoes an address is masked before it is logged.
 
-### 3.5 The Meta Cloud API client: hand-rolled, narrow, fake-tested
+### 3.6 The Meta Cloud API client: hand-rolled, narrow, fake-tested
 
 `WhatsAppCloudAPIClient` is grpop's own thin interface over two Graph API
 endpoints (`SendTemplateMessage`, `GetApprovedTemplates`) — no official Go
 SDK exists for WhatsApp regardless of vendor, so a hand-rolled `net/http` +
 `encoding/json` client (`metaCloudAPIClient`) was always required. Sending
 uses `PhoneNumberID`; listing approved templates (which backs
-`TemplateValidator`, §3.6) needs the WhatsApp Business Account ID instead —
+`TemplateValidator`, §3.7) needs the WhatsApp Business Account ID instead —
 a separate ID Meta assigns, added to `MetaCloudDispatcherDeps` as
 `BusinessAccountID` during implementation once this distinction became
 concrete (the original plan draft didn't separate the two IDs). This is
@@ -144,7 +157,7 @@ real local `httptest.Server` (not Meta itself, but a real HTTP round trip). Ever
 `v26.0`; Meta retires a version about two years after release, and the
 earlier hard-coded `v20.0` stopped on 2026-09-24).
 
-### 3.6 `TemplateValidator`: advisory, TTL-cached, never a false negative
+### 3.7 `TemplateValidator`: advisory, TTL-cached, never a false negative
 
 Meta requires every WhatsApp template to go through approval before use;
 `TemplateValidator.Validate` checks both approval status and that
@@ -162,7 +175,7 @@ so the cache can only ever produce a false *positive* window (a
 since-revoked template briefly still looks approved), never a false
 negative that blocks a send that would have succeeded.
 
-### 3.7 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
+### 3.8 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
 
 `SMTPClient` (`Auth`/`Mail`/`Rcpt`/`Data`/`Close`) is satisfied directly by
 `*net/smtp.Client` — no adapter type needed. `SMTPDialer.Dial` performs the
@@ -198,5 +211,5 @@ recipient key and the fail-closed policy carry over to `checkRateLimits`
 The SMTP sender is tested against a **real local Mailpit** (`t.Skip`-ing
 when it isn't reachable) as well as a fake `SMTPClient`; `-race` is
 mandatory. The Meta Cloud API client is the one documented exception
-(§3.5): a fake client for the sender's wiring, an `httptest.Server` for the
+(§3.6): a fake client for the sender's wiring, an `httptest.Server` for the
 real HTTP client. `make coverage-check` gates the package at 95%.

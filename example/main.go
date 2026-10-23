@@ -58,8 +58,9 @@ func main() {
 	now := time.Now()
 
 	sendWithRetry(ctx, emailSender, "forgot password", grpop.EmailMessage{
-		To:           "user@example.com",
-		TemplateName: EmailTemplateForgotPassword,
+		To:             "user@example.com",
+		TemplateName:   EmailTemplateForgotPassword,
+		IdempotencyKey: "demo-forgot-password",
 		TemplateData: map[string]any{
 			"AppName":          appName,
 			"RecipientName":    "Ada",
@@ -69,8 +70,9 @@ func main() {
 	}, now.Add(30*time.Minute)) // the reset link's own expiry: retrying past it delivers a dead link
 
 	sendWithRetry(ctx, emailSender, "provider invite", grpop.EmailMessage{
-		To:           "new-provider@example.com",
-		TemplateName: EmailTemplateInvite,
+		To:             "new-provider@example.com",
+		TemplateName:   EmailTemplateInvite,
+		IdempotencyKey: "demo-provider-invite",
 		TemplateData: map[string]any{
 			"AppName":        appName,
 			"TenantName":     tenantName,
@@ -81,8 +83,9 @@ func main() {
 	}, now.Add(72*time.Hour))
 
 	sendWithRetry(ctx, emailSender, "admin invite", grpop.EmailMessage{
-		To:           "new-admin@example.com",
-		TemplateName: EmailTemplateInvite,
+		To:             "new-admin@example.com",
+		TemplateName:   EmailTemplateInvite,
+		IdempotencyKey: "demo-admin-invite",
 		TemplateData: map[string]any{
 			"AppName":        appName,
 			"TenantName":     tenantName,
@@ -93,8 +96,9 @@ func main() {
 	}, now.Add(72*time.Hour))
 
 	sendWithRetry(ctx, emailSender, "tenant first-admin invite", grpop.EmailMessage{
-		To:           "first-admin@example.com",
-		TemplateName: EmailTemplateInvite,
+		To:             "first-admin@example.com",
+		TemplateName:   EmailTemplateInvite,
+		IdempotencyKey: "demo-first-admin-invite",
 		TemplateData: map[string]any{
 			"AppName":        appName,
 			"TenantName":     tenantName,
@@ -112,8 +116,9 @@ func main() {
 // link the message carries is dead by then). A failure matching
 // grpop.ErrPermanent (a bad address, a mailbox that doesn't exist, a
 // template that won't render) stops at once: it would fail the same way
-// every time. A real caller keeps the message durably between attempts so a
-// crash doesn't lose it; this demo only loops.
+// every time. Each message carries an IdempotencyKey, so every attempt at it
+// has the same Message-ID. A real caller keeps the message durably between
+// attempts so a crash doesn't lose it; this demo only loops.
 func sendWithRetry(ctx context.Context, sender grpop.EmailSender, label string, msg grpop.EmailMessage, expiresAt time.Time) {
 	const maxAttempts = 3
 	for attempt := 0; ; attempt++ {

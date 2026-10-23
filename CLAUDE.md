@@ -77,6 +77,13 @@ against a fake `WhatsAppCloudAPIClient`, and the real HTTP client against an
   inside its optional circuit breaker, and records metrics. A failed attempt
   is `(SendResult{Status: SendStatusFailed}, err)`; an accepted one is
   `(result, nil)`. `SendStatusSent` means only that the vendor accepted it.
+- **Every email sender starts from `prepareEmail`** (`dispatcher.email.go`):
+  it checks the message, renders its one content mode, applies the default
+  sender and parses the addresses, so all email vendors send and refuse
+  alike. A new email sender builds its request from the `preparedEmail` and
+  never re-reads `EmailMessage` fields itself. `EmailMessage.IdempotencyKey`
+  rides along: sent as is to a vendor with idempotency, turned into a stable
+  `Message-ID` (its SHA-256) by the SMTP sender.
 - **Rate limiting is the caller's limiter, on two keys** (`ratelimiter.go`).
   `RateLimiter` is `Allow(ctx, key) (bool, error)`, grsentry's
   `pkg/grlimiter.Limiter`'s method set, so it plugs in without an import

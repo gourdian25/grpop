@@ -197,6 +197,12 @@ fail the same way on every attempt matches it, and nothing else does.
   cancelled context, a Meta `429` or `5xx`, and Meta's retry-later codes (2,
   4, 80007, 130429, 131000, 131016, 131056, 133004, 2494100).
 
+**`EmailMessage.IdempotencyKey`** (optional) is the same value on every
+attempt at one message, an outbox row's id say. The SMTP sender makes the
+`Message-ID` its SHA-256 (the key itself never appears in the message), so a
+retried message carries the same `Message-ID`; SMTP can do no more than
+that. Never give two different messages one key.
+
 `ErrInvalidAddress` covers a `From`, `To` or `Reply-To` that `net/mail` can't
 parse or that carries a line break (which would add a header of its own); it
 names the field, never the value. Display names are fine

@@ -5,6 +5,8 @@ package grpop
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -702,5 +704,43 @@ func TestSMTPDispatcher_LogsMaskedAddresses(t *testing.T) {
 	}
 	if !strings.Contains(logged, "a***@example.com") {
 		t.Fatalf("the logs don't name the masked recipient:\n%s", logged)
+	}
+}
+
+// TestSMTPDispatcher_Send_IdempotencyKeyFixesMessageID: every attempt at one
+// message (one key) carries the same Message-ID, the SHA-256 of the key at
+// the sender's domain, and the key itself never appears in the message;
+// another key, or none, gives another.
+func TestSMTPDispatcher_Send_IdempotencyKeyFixesMessageID(t *testing.T) {
+	send := func(key string) (string, string) {
+		t.Helper()
+		client := &fakeSMTPClient{}
+		sender, _ := newTestSMTPDispatcher(t, client, nil)
+		result, err := sender.Send(context.Background(), EmailMessage{To: "a@b.com", Subject: "s", TextBody: "b", IdempotencyKey: key})
+		if err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+		return result.ProviderMessageID, string(client.dataWritten)
+	}
+
+	first, raw := send("outbox-row-42")
+	again, _ := send("outbox-row-42")
+	if first != again {
+		t.Fatalf("one key gave two Message-IDs: %q, %q", first, again)
+	}
+	sum := sha256.Sum256([]byte("outbox-row-42"))
+	if want := hex.EncodeToString(sum[:]) + "@example.com"; first != want {
+		t.Fatalf("Message-ID = %q, want %q", first, want)
+	}
+	if !strings.Contains(raw, "Message-ID: <"+first+">\r\n") || strings.Contains(raw, "outbox-row-42") {
+		t.Fatalf("the header doesn't carry the derived id, or the key leaked:\n%s", raw)
+	}
+	if other, _ := send("outbox-row-43"); other == first {
+		t.Fatal("two keys gave one Message-ID")
+	}
+	none1, _ := send("")
+	none2, _ := send("")
+	if none1 == none2 || none1 == first {
+		t.Fatalf("without a key the Message-ID should be random: %q, %q", none1, none2)
 	}
 }

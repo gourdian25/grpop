@@ -5,7 +5,9 @@ package grpop
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -199,38 +201,11 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 	if err := ctx.Err(); err != nil {
 		return SendResult{}, err
 	}
-	if err := validateEmailMessage(msg); err != nil {
-		return SendResult{}, err
-	}
-
-	subject, htmlBody, textBody, err := d.resolveContent(msg)
+	email, err := prepareEmail(msg, d.defaultFrom, d.templateEngine)
 	if err != nil {
 		return SendResult{}, err
 	}
-
-	from := msg.From
-	if from == "" {
-		from = d.defaultFrom
-	}
-	if from == "" {
-		return SendResult{}, ErrEmailFromRequired
-	}
-	fromAddr, err := parseEmailAddress("From", from)
-	if err != nil {
-		return SendResult{}, err
-	}
-	toAddr, err := parseEmailAddress("To", msg.To)
-	if err != nil {
-		return SendResult{}, err
-	}
-	replyTo := ""
-	if msg.ReplyTo != "" {
-		replyToAddr, err := parseEmailAddress("ReplyTo", msg.ReplyTo)
-		if err != nil {
-			return SendResult{}, err
-		}
-		replyTo = replyToAddr.String()
-	}
+	fromAddr, toAddr := email.from, email.to
 
 	if err := checkRateLimits(ctx, ChannelEmail, toAddr.Address, d.rateLimiter, d.recipientLimit, d.metrics); err != nil {
 		return SendResult{}, err
@@ -238,14 +213,18 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 
 	// The headers carry the parsed addresses (a display name Q-encoded);
 	// MAIL FROM and RCPT TO the bare ones.
-	messageID := fmt.Sprintf("%s@%s", generateMemoryID(), messageIDDomain(fromAddr.Address))
+	messageID := smtpMessageID(email.idempotencyKey, fromAddr.Address)
+	replyTo := ""
+	if email.replyTo != nil {
+		replyTo = email.replyTo.String()
+	}
 	raw := buildMIMEMessage(mimeMessageInput{
 		From:      fromAddr.String(),
 		To:        toAddr.String(),
 		ReplyTo:   replyTo,
-		Subject:   subject,
-		HTMLBody:  htmlBody,
-		TextBody:  textBody,
+		Subject:   email.subject,
+		HTMLBody:  email.htmlBody,
+		TextBody:  email.textBody,
 		MessageID: messageID,
 	})
 
@@ -291,26 +270,6 @@ func (d *smtpDispatcher) Send(ctx context.Context, msg EmailMessage) (SendResult
 		Status:            SendStatusSent,
 		SentAt:            time.Now().UTC(),
 	}, nil
-}
-
-// resolveContent turns msg's active content mode (already validated as
-// exactly one by validateEmailMessage) into a literal subject/htmlBody/
-// textBody triple.
-func (d *smtpDispatcher) resolveContent(msg EmailMessage) (subject, htmlBody, textBody string, err error) {
-	switch {
-	case msg.TemplateName != "":
-		if d.templateEngine == nil {
-			return "", "", "", ErrEmailTemplateEngineRequired
-		}
-		return d.templateEngine.Render(msg.TemplateName, msg.TemplateData)
-	case msg.InlineTemplate != nil:
-		if d.templateEngine == nil {
-			return "", "", "", ErrEmailTemplateEngineRequired
-		}
-		return d.templateEngine.RenderInline(*msg.InlineTemplate, msg.TemplateData)
-	default:
-		return msg.Subject, msg.HTMLBody, msg.TextBody, nil
-	}
 }
 
 // transact runs the dial-through-close SMTP transaction on a background
@@ -380,6 +339,21 @@ func smtpResponseCode(err error) int {
 		return protoErr.Code
 	}
 	return 0
+}
+
+// smtpMessageID is the Message-ID (without its angle brackets) for a send
+// from the bare address from: the SHA-256 hex of idempotencyKey when the
+// message has one, so every attempt at the same message carries the same
+// Message-ID (receiving systems may use it to collapse a retried duplicate,
+// and the key itself never appears in the message), and a random one
+// otherwise. Its domain is from's.
+func smtpMessageID(idempotencyKey, from string) string {
+	id := generateMemoryID()
+	if idempotencyKey != "" {
+		sum := sha256.Sum256([]byte(idempotencyKey))
+		id = hex.EncodeToString(sum[:])
+	}
+	return id + "@" + messageIDDomain(from)
 }
 
 // messageIDDomain extracts the domain part of a From address for use in a
