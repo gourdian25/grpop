@@ -14,8 +14,8 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 | P4 | The Resend sender over `net/http` (no SDK) | **Done** 2026-10-24 |
 | P5 | WhatsApp messages: typed components (header, body, buttons; named or positional), the OTP helper, phone and value checks, and the breaker counting only temporary failures | **Done** 2026-10-24 |
 | P6 | The template validator, usable and truthful: an exported Meta client, paginated listing, component-aware counts, advisory when the listing fails; a live Meta smoke test | **Done** 2026-10-24 (live test unrun: needs the user's Meta keys) |
-| *grsentry* | M1a–M1d on this untagged grpop: `../go.work` in workspace mode, a pseudo-version of a pushed `master` commit for `GOWORK=off` and CI. A change M1 needs here becomes a stage of its own | **Next** (the user pushes grpop's `master` first) |
-| P7 | Release `v0.2.0` once grsentry runs on it and grpop needs nothing more: the CHANGELOG dated, `make prerelease`, the user tags; grsentry moves from the pseudo-version to the tag | To do, last |
+| *grsentry* | M1a–M1d on this untagged grpop through grsentry's temporary `replace github.com/gourdian25/grpop => ../grpop` (2026-10-24, the user's choice over a pushed pseudo-version: no push needed; grsentry's CI can't build it, so grsentry isn't pushed or tagged until P7). A change M1 needs here becomes a stage of its own | **Next** |
+| P7 | Release `v0.2.0` once grsentry runs on it and grpop needs nothing more: the CHANGELOG dated, `make prerelease`, the user tags; grsentry drops the `replace` and requires the tag | To do, last |
 
 ## The decisions (the user's, 2026-10-23)
 
@@ -27,7 +27,10 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 - **The order, revised (the user, 2026-10-24):** WhatsApp is completed now (P5, P6), not after grsentry's M1; grsentry then integrates over `../go.work` on the untagged grpop; the tag (P7) comes last, once grsentry runs on it and grpop needs no more changes.
 - **Typed WhatsApp components replace `TemplateVariables`** (2026-10-24; breaking, but 0.2.0 is unreleased): one way to say what a template needs, with no positional-key gaps.
 - **The template validator stays advisory** (2026-10-24): with no fresh list it uses the last one it had, or lets the send through with a warning; Meta decides.
-- **grsentry builds on the untagged grpop through a pseudo-version** (2026-10-24): the user pushes grpop's `master` without a tag and grsentry's `go.mod` requires that commit (`go get github.com/gourdian25/grpop@<commit>`), so `GOWORK=off` builds, CI and `make e2e` get the same code the workspace uses from `../grpop`. P7's tag replaces it.
+- **grsentry builds on the untagged grpop through a local `replace`** (2026-10-24; the user's choice, which replaced the first decision of the day, a pushed pseudo-version). grsentry's `go.mod` carries `replace github.com/gourdian25/grpop => ../grpop`.
+  - **Where it works:** in the workspace and with `GOWORK=off` (the gate, `make e2e`), with nothing pushed.
+  - **The cost:** grsentry's CI, release build and deploy check out grsentry alone and can't resolve it. From grsentry's first grpop import until P7, grsentry isn't pushed to `dev`/`master` or tagged.
+  - **P7:** the tag replaces it.
 - **The circuit breaker counts only temporary failures** (2026-10-24, P2's open point): a permanent failure is about one message, not the vendor's health, and a burst of `550`s for bad addresses must not block every recipient.
 - **No rate limiter of grpop's own** (the user, 2026-10-23: reuse grsentry's `grlimiter`). Importing `grsentry/pkg/grlimiter` would make the two modules require each other and pull grsentry's dependencies (gin, through its middleware) into grpop. Instead `RateLimiter` takes `grlimiter.Limiter`'s exact shape, `Allow(ctx, key) (bool, error)`, so grsentry passes its limiter in with no adapter and no import either way. grpop's in-process and Redis limiters and their LRU go (P1). grpop then depends on the standard library alone.
 
@@ -333,7 +336,7 @@ After grsentry's M1 runs on grpop and no more grpop change is needed:
 - `make prerelease`;
 - the live Resend and Meta tests run with the user's keys, so the tag ships with both vendors proven.
 
-Tagging and publishing (`make release VERSION=v0.2.0`) is outward-facing: the user runs it or says to. grsentry's `go.mod` then moves from the pseudo-version to `v0.2.0`.
+Tagging and publishing (`make release VERSION=v0.2.0`) is outward-facing: the user runs it or says to. grsentry then drops its `replace` and requires `v0.2.0` (`go get github.com/gourdian25/grpop@v0.2.0`), and can be pushed again.
 
 ## Known and accepted
 
