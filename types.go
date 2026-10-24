@@ -60,6 +60,15 @@ type EmailMessage struct {
 	TemplateName   string
 	InlineTemplate *EmailTemplate
 	TemplateData   map[string]any
+
+	// IdempotencyKey is optional: the same value on every attempt at one
+	// message (a grsentry outbox row's id, say), so a sender that can tell
+	// the vendor makes a retry safe. The SMTP sender derives the
+	// Message-ID from it (its SHA-256, so the key itself never appears in
+	// the message), which receiving systems may use to collapse a
+	// duplicate; it can do no more, since SMTP has no idempotency of its
+	// own. Two different messages must never share one.
+	IdempotencyKey string
 }
 
 // WhatsAppMessage is structurally different from EmailMessage on purpose:
@@ -80,14 +89,154 @@ type EmailMessage struct {
 // can for email, because Meta's own approval process is the source of
 // truth for what content is allowed to go out. TemplateValidator only
 // checks against whatever is already approved; it never submits new ones.
+//
+// Header, Body and Buttons fill the template's placeholders, each value
+// typed the way Meta's send API takes it; a template with none leaves all
+// three empty. An authentication (one-time code) template is
+// WhatsAppOTP's Body and Buttons.
 type WhatsAppMessage struct {
-	To           string // E.164 phone number, required
+	To string // required: international form, an optional "+" then 7 to 15 digits
+	// with no spaces or dashes ("+15551234567"); anything else is ErrInvalidPhoneNumber
 	TemplateName string // required — the Meta-approved template's name; any approved name
 	// works, nothing hardcoded/enumerated grpop-side
-	TemplateVariables map[string]string // stringified positional keys ("1","2","3", in order),
-	// per Meta Cloud API's template-parameter convention
 	LanguageCode string // e.g. "en_US", required, must match the approved template's
 	// registered language
+
+	// Header fills the template's header: a text value for a text header
+	// with a placeholder, or the image, video, document or location a
+	// media or location header shows. nil when the header has nothing to
+	// fill.
+	Header *WhatsAppParameter
+
+	// Body fills the body's placeholders: in placeholder order ({{1}},
+	// {{2}}, ...) for a positional template, or each with its Name
+	// ({{first_name}}) in any order for a named one, never a mix of the
+	// two. Text, currency and date-and-time values only.
+	Body []WhatsAppParameter
+
+	// Buttons fills the buttons that take a value at send time, each by
+	// its position among the template's buttons.
+	Buttons []WhatsAppButton
+}
+
+// WhatsAppParameter is one template value. It holds exactly one of Text,
+// Currency, DateTime, Media or Location. Name is set only in a named
+// template, and only on a text, currency or date-and-time value.
+type WhatsAppParameter struct {
+	// Name is the placeholder's name in a named template ("first_name" for
+	// {{first_name}}): lower-case letters, digits and underscores. Empty in
+	// a positional template.
+	Name string
+
+	// Text is a plain value. Meta refuses one with a line break, a tab or
+	// five spaces in a row; a header's is at most 60 characters.
+	Text     string
+	Currency *WhatsAppCurrency
+	DateTime *WhatsAppDateTime
+	Media    *WhatsAppMedia    // a header's only
+	Location *WhatsAppLocation // a header's only
+}
+
+// WhatsAppCurrency is an amount of money.
+type WhatsAppCurrency struct {
+	FallbackValue string // the text shown when WhatsApp can't format the amount ("$100.99")
+	Code          string // ISO 4217, upper case ("USD")
+	Amount1000    int64  // the amount times 1000 (100990 for 100.99)
+}
+
+// WhatsAppDateTime is a date and time, sent as the text WhatsApp shows.
+type WhatsAppDateTime struct {
+	FallbackValue string
+}
+
+// WhatsAppMediaKind is a media header's kind.
+type WhatsAppMediaKind string
+
+const (
+	WhatsAppMediaImage    WhatsAppMediaKind = "image"
+	WhatsAppMediaVideo    WhatsAppMediaKind = "video"
+	WhatsAppMediaDocument WhatsAppMediaKind = "document"
+)
+
+// WhatsAppMedia is a media header's file: exactly one of ID (from Meta's
+// media upload) or Link (a public HTTPS URL Meta fetches).
+type WhatsAppMedia struct {
+	Kind     WhatsAppMediaKind
+	ID       string
+	Link     string
+	Filename string // the name a document shows; documents only
+}
+
+// WhatsAppLocation is a location header's place.
+type WhatsAppLocation struct {
+	Latitude  float64 // -90 to 90
+	Longitude float64 // -180 to 180
+	Name      string  // optional
+	Address   string  // optional
+}
+
+// WhatsAppButtonKind is what a button's Value is.
+type WhatsAppButtonKind string
+
+const (
+	// WhatsAppButtonURL: Value is the suffix appended to the button's URL.
+	WhatsAppButtonURL WhatsAppButtonKind = "url"
+	// WhatsAppButtonQuickReply: Value is the payload Meta's webhook returns
+	// when the recipient taps it.
+	WhatsAppButtonQuickReply WhatsAppButtonKind = "quick_reply"
+	// WhatsAppButtonCopyCode: Value is a marketing template's coupon code,
+	// at most 20 characters.
+	WhatsAppButtonCopyCode WhatsAppButtonKind = "copy_code"
+	// WhatsAppButtonOTP: Value is an authentication template's one-time
+	// code, at most 15 characters, which must also be the Body's one value
+	// (Meta takes the code twice). WhatsAppOTP builds both.
+	WhatsAppButtonOTP WhatsAppButtonKind = "otp"
+)
+
+// WhatsAppButton fills one button of the template.
+type WhatsAppButton struct {
+	Index int // the button's position among the template's buttons, 0 to 9
+	Kind  WhatsAppButtonKind
+	Value string
+	// Name is a URL button's placeholder name in a named template; empty
+	// otherwise.
+	Name string
+}
+
+// WhatsAppText is a text value for a positional template.
+func WhatsAppText(text string) WhatsAppParameter {
+	return WhatsAppParameter{Text: text}
+}
+
+// WhatsAppNamedText is a text value for a named template's {{name}}.
+func WhatsAppNamedText(name, text string) WhatsAppParameter {
+	return WhatsAppParameter{Name: name, Text: text}
+}
+
+// WhatsAppImage is an image header fetched from link.
+func WhatsAppImage(link string) WhatsAppParameter {
+	return WhatsAppParameter{Media: &WhatsAppMedia{Kind: WhatsAppMediaImage, Link: link}}
+}
+
+// WhatsAppVideo is a video header fetched from link.
+func WhatsAppVideo(link string) WhatsAppParameter {
+	return WhatsAppParameter{Media: &WhatsAppMedia{Kind: WhatsAppMediaVideo, Link: link}}
+}
+
+// WhatsAppDocument is a document header fetched from link, shown as
+// filename.
+func WhatsAppDocument(link, filename string) WhatsAppParameter {
+	return WhatsAppParameter{Media: &WhatsAppMedia{Kind: WhatsAppMediaDocument, Link: link, Filename: filename}}
+}
+
+// WhatsAppOTP is the Body and Buttons of an authentication template's send
+// (Meta's copy-code and one-tap templates): the code as the body's one
+// value and again as button 0's, the two places Meta requires it.
+//
+//	msg := grpop.WhatsAppMessage{To: to, TemplateName: "login_code", LanguageCode: "en_US"}
+//	msg.Body, msg.Buttons = grpop.WhatsAppOTP(code)
+func WhatsAppOTP(code string) ([]WhatsAppParameter, []WhatsAppButton) {
+	return []WhatsAppParameter{{Text: code}}, []WhatsAppButton{{Index: 0, Kind: WhatsAppButtonOTP, Value: code}}
 }
 
 // SendStatus is the result of a vendor call, not a delivery-receipt
@@ -99,8 +248,8 @@ const (
 	SendStatusFailed SendStatus = "failed" // the vendor rejected the request, or the call itself errored
 )
 
-// SendResult is the delivery-status handle every Service.SendX call
-// returns.
+// SendResult is what every sender's Send returns: what the vendor said,
+// for the one attempt it made.
 type SendResult struct {
 	Channel           Channel
 	ProviderMessageID string // vendor's own message/tracking ID (Meta's wamid, or the
@@ -108,110 +257,6 @@ type SendResult struct {
 	Status SendStatus
 	SentAt time.Time
 	Raw    map[string]string // optional vendor-specific diagnostic fields — logging only
-
-	// Duplicate is true if this call short-circuited on
-	// IdempotencyStore.IsProcessed (the same IdempotencyKey was already
-	// marked processed) rather than performing a new vendor call. A dedup
-	// hit is not silent: Service also logs a Warn and increments
-	// Metrics.IncIdempotencyDedupHit on every hit regardless of whether the
-	// caller inspects this field — see Service's doc comment.
-	Duplicate bool
-}
-
-// SendOptions carries per-send cross-cutting behavior.
-type SendOptions struct {
-	// IdempotencyKey is REQUIRED — Service.SendEmail/SendWhatsApp return
-	// ErrIdempotencyKeyRequired if it's empty. grpop's inline retry-on-
-	// transient-failure is at-least-once, not exactly-once (docs.go): a
-	// network error after the vendor already accepted the message is
-	// indistinguishable from one before, so a retry can double-send. The
-	// guarantee against a caller-visible double-send comes entirely from
-	// the caller supplying a stable key and IdempotencyStore catching the
-	// redelivery.
-	IdempotencyKey string
-	IdempotencyTTL time.Duration // 0 uses the configured default
-	SkipRateLimit  bool          // escape hatch, e.g. an admin-triggered manual resend
-
-	// RetryExpiresAt is the hard wall-clock deadline after which grpop
-	// stops retrying a failed send entirely, regardless of remaining
-	// retry-count budget. Zero value uses the configured default max retry
-	// age, measured from the first failure, not from this call. Callers
-	// who know their own message's real expiry (a password-reset link's
-	// TTL, an invite token's expiry) should set this explicitly rather
-	// than relying on the library default.
-	RetryExpiresAt time.Time
-}
-
-// DLQStatus is a DLQEvent's lifecycle state.
-type DLQStatus string
-
-const (
-	// DLQStatusPending is newly-recorded or awaiting its next retry.
-	DLQStatusPending DLQStatus = "pending"
-	// DLQStatusRetrying means a worker currently holds an atomic claim on
-	// this event (see DLQHandler.ClaimRetryableEvents) and is attempting
-	// delivery — not a status any caller sets directly.
-	DLQStatusRetrying DLQStatus = "retrying"
-	// DLQStatusResolved means a retry eventually succeeded.
-	DLQStatusResolved DLQStatus = "resolved"
-	// DLQStatusExhausted means RetryCount reached MaxRetries before
-	// ExpiresAt passed.
-	DLQStatusExhausted DLQStatus = "exhausted"
-	// DLQStatusExpired means ExpiresAt passed before a successful retry,
-	// independent of remaining RetryCount budget. Unrelated to
-	// DLQHandler.PurgeExpiredEvents' own, different sense of "expired"
-	// (old enough to delete) — see that method's doc comment.
-	DLQStatusExpired DLQStatus = "expired"
-)
-
-// DLQMessage is a channel-tagged envelope — exactly one of Email/WhatsApp
-// is non-nil, matching Channel.
-type DLQMessage struct {
-	Channel  Channel
-	Email    *EmailMessage
-	WhatsApp *WhatsAppMessage
-
-	// ExpiresAt is the hard wall-clock deadline after which this event
-	// stops being retried at all, regardless of remaining RetryCount
-	// budget — set by Service from SendOptions.RetryExpiresAt or the
-	// configured default max retry age before PublishToDLQ is called.
-	ExpiresAt time.Time
-}
-
-// DLQRetryAttempt records the outcome of one retry attempt for a DLQEvent.
-type DLQRetryAttempt struct {
-	AttemptNumber int
-	AttemptedAt   time.Time
-	Success       bool
-	ErrorMessage  string
-}
-
-// DLQEvent is the durable record of one failed send, awaiting retry or
-// already Resolved/Exhausted/Expired.
-type DLQEvent struct {
-	SendID         string
-	MessageData    DLQMessage // carries Channel and ExpiresAt
-	FailureReason  string
-	RetryCount     int
-	MaxRetries     int
-	FirstFailureAt time.Time
-	LastAttemptAt  time.Time
-	NextRetryAt    time.Time
-	Status         DLQStatus
-	AttemptHistory []DLQRetryAttempt // capped at a configured maximum entry count, oldest dropped first
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-}
-
-// RateLimiterStats is a point-in-time snapshot of one (channel, recipient)
-// bucket's counters.
-type RateLimiterStats struct {
-	RequestsPerSecond int
-	BurstSize         int
-	AllowedCount      int64
-	BlockedCount      int64
-	WaitCount         int64
-	LastAllowedAt     time.Time
 }
 
 // CircuitState is a CircuitBreaker's current state.
@@ -265,12 +310,42 @@ type CircuitBreakerStats struct {
 	TimeUntilNextAttempt time.Duration
 }
 
-// WhatsAppTemplateInfo describes one Meta-approved template, as returned
-// by a WhatsApp dispatcher's vendor-narrow client.
+// WhatsAppTemplateInfo describes one Meta-approved template: what each part
+// of it takes at send time, read from Meta's template listing
+// (WhatsAppCloudAPIClient.GetApprovedTemplates), so TemplateValidator can
+// check a WhatsAppMessage's Header, Body and Buttons against it.
 type WhatsAppTemplateInfo struct {
-	Name           string
-	LanguageCode   string
-	ParameterCount int // number of positional variables ("1","2","3", ...) the approved
-	// template body actually expects, so TemplateValidator.Validate can
-	// catch an arity mismatch, not just approval status
+	Name         string
+	LanguageCode string
+
+	// Named is a template whose placeholders are names ({{first_name}},
+	// Meta's NAMED parameter format); otherwise they are positional
+	// ({{1}}, {{2}}, ...).
+	Named bool
+
+	// HeaderFormat is Meta's header format: "TEXT", "IMAGE", "VIDEO",
+	// "DOCUMENT" or "LOCATION" ("" for no header). A media or location
+	// header takes its value at every send; a text one only when it has a
+	// placeholder.
+	HeaderFormat string
+
+	// HeaderParameters and BodyParameters are the placeholders of a text
+	// header and of the body, each once, in order of first appearance:
+	// "1", "2", ... or the names.
+	HeaderParameters []string
+	BodyParameters   []string
+
+	// Buttons are the template's buttons, in order.
+	Buttons []WhatsAppTemplateButton
+}
+
+// WhatsAppTemplateButton is one button of an approved template.
+type WhatsAppTemplateButton struct {
+	Index int    // its position among the template's buttons
+	Type  string // Meta's button type: "URL", "QUICK_REPLY", "COPY_CODE", "OTP", "PHONE_NUMBER", ...
+	// RequiresValue is a button every send must fill: a URL with a
+	// placeholder (a one-time code's button is one: Meta lists a created
+	// authentication button as a URL), a coupon code, a one-time code. A
+	// quick reply's payload is optional.
+	RequiresValue bool
 }

@@ -3,8 +3,8 @@
 package grpop
 
 // Logger is the minimal logging interface grpop accepts for optional
-// diagnostic logging (vendor connectivity failures, dispatch retries,
-// circuit-breaker state transitions, idempotency dedup hits, shutdown).
+// diagnostic logging (vendor connectivity failures, sends,
+// circuit-breaker state transitions).
 // Its four methods match *slog.Logger's own signatures exactly, so
 // *slog.Logger satisfies it structurally — grpop itself does not import
 // grlog or log/slog, so plugging in a logger is entirely opt-in and adds
@@ -24,7 +24,7 @@ package grpop
 //
 //	logger := slog.New(grlog.NewSlogHandler(grlog.NewDefaultLogger()))
 //	deps.Logger = logger
-//	svc, err := grpop.NewService(deps)
+//	sender, err := grpop.NewSMTPDispatcher(deps)
 type Logger interface {
 	Debug(msg string, args ...any)
 	Info(msg string, args ...any)

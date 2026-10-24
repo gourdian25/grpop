@@ -5,11 +5,11 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Send-only, multi-channel transactional-messaging delivery library for the
-gourdian ecosystem (`github.com/gourdian25/grpop`): email (stdlib SMTP) and
-WhatsApp (Meta Cloud API, direct) dispatch, idempotent send processing, a
-hard-deadline dead-letter retry queue, circuit breaking, and
-per-channel-and-per-recipient rate limiting, behind a set of storage- and
-vendor-agnostic interfaces.
+gourdian ecosystem (`github.com/gourdian25/grpop`): email (stdlib SMTP, or
+Resend's API) and WhatsApp (Meta Cloud API, direct) senders that each **send one message once
+and report what the vendor said**, with templates, optional circuit breaking
+and optional per-channel and per-recipient rate limiting through a limiter
+you supply. No third-party Go dependencies.
 
 grpop is **not** an email-retrieval/POP3 library despite the name, and
 **not** a push-notification library — that's the sibling module
@@ -17,25 +17,20 @@ grpop is **not** an email-retrieval/POP3 library despite the name, and
 of "user" or "preferences"; it's about delivery, not identity — the
 recipient address/number is supplied per-send by the caller.
 
-Status: feature-complete per the 16-stage build plan
-([docs/plan/grpop-plan.md](docs/plan/grpop-plan.md)), pre-tagged-release.
-`golangci-lint run` reports 0 issues; test coverage is 95.7%+ on the root
-package, enforced by a 95% gate (`make coverage-check`), verified against
-real local PostgreSQL/MongoDB/Redis/Mailpit instances (see
-[CLAUDE.md](CLAUDE.md) for the docker setup) — Meta's WhatsApp Cloud API is
-the one deliberate exception, tested against a fake client since Meta ships
-no local emulator.
+Status: being reshaped to delivery only, then given a Resend sender
+([docs/plan/2026-10-23-grpop-delivery-only.md](docs/plan/2026-10-23-grpop-delivery-only.md)).
+`v0.1.0` had an orchestrating `Service` with an idempotency store and a
+dead-letter retry table; they are gone (see
+[Delivery only](#delivery-only)).
 
 ## Table of Contents
 
-- [Part of the gourdian25 ecosystem](#part-of-the-gourdian25-ecosystem)
+- [Delivery only](#delivery-only)
 - [Install](#install)
 - [Dependencies](#dependencies)
 - [Quickstart](#quickstart)
-- [An intermediate example: DLQ, circuit breaker, rate limiting](#an-intermediate-example-dlq-circuit-breaker-rate-limiting)
-- [Configuration](#configuration)
+- [Circuit breaking and rate limiting](#circuit-breaking-and-rate-limiting)
 - [Public API overview](#public-api-overview)
-- [Why this shape](#why-this-shape)
 - [Error handling](#error-handling)
 - [Limitations / out of scope](#limitations--out-of-scope)
 - [Testing](#testing)
@@ -43,26 +38,16 @@ no local emulator.
 - [Contributing](#contributing)
 - [License](#license)
 
-## Part of the gourdian25 ecosystem
+## Delivery only
 
-grpop is one of several small, independent Go libraries meant to be used
-together:
-
-- [grcache](https://github.com/gourdian25/grcache) — backend-agnostic
-  caching abstraction; grpop's `NewCacheIdempotencyStore` wraps any
-  `grcache.Cache` directly, no adapter needed.
-- [grevents](https://github.com/gourdian25/grevents) — an in-process event
-  bus; grpop optionally publishes `message.sent`/`message.failed` lifecycle
-  events through it — best-effort, so a nil bus or a publish failure never
-  affects the actual send it follows.
-- [grnoti](https://github.com/gourdian25/grnoti) — push notifications (FCM);
-  the sibling this module was deliberately named to avoid colliding with.
-- [gourdiantoken](https://github.com/gourdian25/gourdiantoken) — JWT
-  access/refresh token issuance; a natural source of the reset/invite tokens
-  grpop delivers links for.
-- [graudit](https://github.com/gourdian25/graudit) — an append-only,
-  tamper-evident audit log, if a durable send-history record beyond the DLQ
-  is ever needed.
+grpop keeps nothing and retries nothing. Retrying a failed send, keeping a
+message durably until it goes, and suppressing a duplicate are the
+caller's: only the caller knows the transaction a message belongs to and
+how long its link stays valid, and only a store written in that transaction
+(an outbox) can promise a committed message is never lost. grsentry does
+all three with an outbox and calls a grpop sender from its worker.
+`FullJitterBackoff` is exported for your retry loop; see
+[example/main.go](example/main.go)'s `sendWithRetry` for the smallest one.
 
 ## Install
 
@@ -72,18 +57,14 @@ go get github.com/gourdian25/grpop
 
 ## Dependencies
 
-grpop is a single flat package with no subpackages of its own (see
-[Why this shape](#why-this-shape)). Unlike `grnoti`, importing grpop pulls
-in **zero vendor-messaging SDKs and zero message-broker client library**:
-email goes over plain stdlib `net/smtp` (any SMTP-speaking vendor — SES,
-SendGrid, Postmark, Mailgun, a bare relay — is just a config value, not a
-Go dependency), and WhatsApp goes directly against Meta's Graph API over a
-hand-rolled `net/http` client (Meta ships no official Go SDK regardless).
-The only third-party imports anywhere in this module are for its own
-storage/rate-limiting backends — `pgx/v5`, `go-redis/v9`, optionally
-`mongo-driver` — and `grcache`'s/`grevents`' own lightweight root-interface
-packages. A consumer using only the in-memory backends and a local rate
-limiter pulls in none of even those.
+None outside the standard library. Email goes over `net/smtp`, so any
+SMTP-speaking vendor (SES, SendGrid, Postmark, Mailgun, Resend's
+`smtp.resend.com`, a bare relay) is a config value, not a Go dependency, or
+over Resend's HTTP API through a hand-rolled `net/http` client (no Resend
+SDK). WhatsApp goes directly against Meta's Graph API the same way (Meta
+ships no official Go SDK). There is no rate-limiter
+implementation to pull in: `RateLimiter` is one method, and you pass your
+own.
 
 ## Quickstart
 
@@ -94,7 +75,7 @@ engine.RegisterTemplate("password-reset", grpop.EmailTemplate{
     HTMLBodyTemplate: `<p>Click <a href="{{.ResetLink}}">here</a> to reset your password.</p>`,
 })
 
-emailSender, err := grpop.NewSMTPDispatcher(grpop.SMTPDispatcherDeps{
+sender, err := grpop.NewSMTPDispatcher(grpop.SMTPDispatcherDeps{
     Addr:           "email-smtp.us-east-1.amazonaws.com:587",
     Auth:           smtp.PlainAuth("", sesUser, sesPass, "email-smtp.us-east-1.amazonaws.com"),
     DefaultFrom:    "no-reply@example.com",
@@ -103,35 +84,63 @@ emailSender, err := grpop.NewSMTPDispatcher(grpop.SMTPDispatcherDeps{
 if err != nil {
     log.Fatal(err)
 }
-defer emailSender.Close()
+defer sender.Close()
 
-// WhatsAppSender is required by Service even if you only send email today
-// — swap NewDryRunWhatsAppSender for grpop.NewMetaCloudWhatsAppDispatcher
-// once you have real Meta credentials.
-whatsAppSender := grpop.NewDryRunWhatsAppSender(nil)
-
-cache, _ := grcache.NewMemoryCache() // swap for NewRedisCache/NewMongoCache in production
-svc, err := grpop.NewService(grpop.ServiceDeps{
-    IdempotencyStore: grpop.NewCacheIdempotencyStore(cache),
-    DLQHandler:       grpop.NewMemoryDLQHandler(5, time.Second, 30*time.Second, 20),
-    EmailSender:      emailSender,
-    WhatsAppSender:   whatsAppSender,
-    Config:           grpop.DefaultServiceConfig(),
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer svc.Close()
-
-result, err := svc.SendEmail(ctx, grpop.EmailMessage{
+result, err := sender.Send(ctx, grpop.EmailMessage{
     To:           "user@example.com",
     TemplateName: "password-reset",
     TemplateData: map[string]any{"ResetLink": link},
-}, grpop.SendOptions{
-    IdempotencyKey: hashOf(token), // required — see Configuration below
-    RetryExpiresAt: tokenExpiresAt, // the reset token's own real expiry
+})
+switch {
+case err == nil:
+    // accepted by the vendor
+case errors.Is(err, grpop.ErrPermanent):
+    // it will fail the same way every time: stop
+default:
+    // temporary: your retry tries again later
+}
+```
+
+The Resend sender takes the same `EmailMessage` and renders it the same way;
+pick it instead of SMTP to get Resend's idempotency (below) and its email id:
+
+```go
+sender, err := grpop.NewResendDispatcher(grpop.ResendDispatcherDeps{
+    APIKey:         os.Getenv("RESEND_API_KEY"),
+    DefaultFrom:    "Acme <no-reply@acme.test>", // a domain verified in Resend
+    TemplateEngine: engine,
 })
 ```
+
+A WhatsApp message names a Meta-approved template and fills its
+placeholders with typed values: `Header` (text, image, video, document or
+location), `Body` (text, currency or date and time, positional or named) and
+`Buttons` (a URL suffix, a quick-reply payload, a coupon code or a one-time
+code). An authentication template's code goes in twice, which
+`WhatsAppOTP` does:
+
+```go
+sender, err := grpop.NewMetaCloudWhatsAppDispatcher(grpop.MetaCloudDispatcherDeps{
+    PhoneNumberID: os.Getenv("META_PHONE_NUMBER_ID"),
+    AccessToken:   os.Getenv("META_ACCESS_TOKEN"),
+})
+
+msg := grpop.WhatsAppMessage{To: "+15551234567", TemplateName: "login_code", LanguageCode: "en_US"}
+msg.Body, msg.Buttons = grpop.WhatsAppOTP(code)
+result, err := sender.Send(ctx, msg)
+
+// a positional template: {{1}} and {{2}}, in order
+order := grpop.WhatsAppMessage{To: "+15551234567", TemplateName: "order_shipped", LanguageCode: "en_US",
+    Body:    []grpop.WhatsAppParameter{grpop.WhatsAppText("Ada"), grpop.WhatsAppText("#42")},
+    Buttons: []grpop.WhatsAppButton{{Index: 0, Kind: grpop.WhatsAppButtonURL, Value: "track/42"}},
+}
+```
+
+Before calling Meta, the sender refuses a number that isn't in international
+form (`ErrInvalidPhoneNumber`) and any value Meta's send-time rules refuse
+(`ErrWhatsAppParameterInvalid`, naming the field). Examples: a line break, a
+tab or five spaces in a row in a value; a header over 60 characters; a
+one-time code over 15; named and positional values mixed.
 
 See [example/main.go](example/main.go) and
 [example/templates_auth.go](example/templates_auth.go) for a complete,
@@ -140,13 +149,9 @@ against (forgot-password + three invite variants) — `go run ./example`,
 against a local [Mailpit](https://github.com/axllent/mailpit) container by
 default, no real credentials required.
 
-## An intermediate example: DLQ, circuit breaker, rate limiting
+## Circuit breaking and rate limiting
 
-The Quickstart above already wires a `DLQHandler` (required by
-`ServiceDeps`). A more realistic production wiring also protects the SMTP
-dispatch path itself with a circuit breaker and a rate limiter — both are
-**dispatcher-level** concerns in grpop, not `Service`-level (see
-[Configuration](#configuration) for why):
+Both are optional and live on the sender's deps, gating every `Send`:
 
 ```go
 // After 5 consecutive SMTP failures, stop calling the relay for 30s and
@@ -157,93 +162,25 @@ if err != nil {
     log.Fatal(err)
 }
 
-// A local (per-process) rate limiter: at most 50 sends/sec per channel AND
-// per (channel, recipient) — a scripted forgot-password sweep across many
-// distinct recipients is still capped by the per-channel tier even though
-// each individual recipient is well under its own limit. Swap for
-// grpop.NewRedisRateLimiter(...) to share one limit across replicas.
-limiter, err := grpop.NewLocalRateLimiter(50, 100, 0)
-if err != nil {
-    log.Fatal(err)
-}
-
-emailSender, err := grpop.NewSMTPDispatcher(grpop.SMTPDispatcherDeps{
-    Addr:           "email-smtp.us-east-1.amazonaws.com:587",
-    Auth:           smtp.PlainAuth("", sesUser, sesPass, "email-smtp.us-east-1.amazonaws.com"),
-    DefaultFrom:    "no-reply@example.com",
-    TemplateEngine: engine,
-    RateLimiter:    limiter,  // gates every Send attempt, including inline retries
-    CircuitBreaker: breaker,  // wraps every vendor call
+sender, err := grpop.NewSMTPDispatcher(grpop.SMTPDispatcherDeps{
+    // ...
+    RateLimiter:          channelLimiter,   // key "email": the whole channel
+    RecipientRateLimiter: recipientLimiter, // key "email:<sha256 of the address>"
+    CircuitBreaker:       breaker,
 })
 ```
 
-`DLQHandler.ClaimRetryableEvents` is never called by `Service` itself —
-draining the queue is a separate, external retry-worker process's job,
-polling periodically:
+The breaker counts only temporary failures (a timeout, a `4xx` reply, a
+vendor `5xx`). A permanent one (`ErrPermanent`: a mailbox that doesn't exist,
+a template Meta refuses) concerns that message, not the vendor's health, and
+the vendor did answer, so the breaker records it as a success. A run of bad
+addresses never opens the breaker on the good messages behind them.
 
-```go
-events, err := dlqHandler.ClaimRetryableEvents(ctx, 50) // atomically claims up to 50
-for _, ev := range events {
-    var result grpop.SendResult
-    var attemptErr error
-    switch ev.MessageData.Channel {
-    case grpop.ChannelEmail:
-        result, attemptErr = emailSender.Send(ctx, *ev.MessageData.Email)
-    case grpop.ChannelWhatsApp:
-        result, attemptErr = whatsAppSender.Send(ctx, *ev.MessageData.WhatsApp)
-    }
-    _ = dlqHandler.MarkRetried(ctx, ev.SendID, attemptErr == nil, attemptErr)
-}
-```
-
-## Configuration
-
-### `NewService(ServiceDeps) (Service, error)`
-
-| `ServiceDeps` field | Required? | Notes |
-|---|:---:|---|
-| `IdempotencyStore` | **required** | duplicate-send suppression |
-| `DLQHandler` | **required** | receives sends whose inline retry is exhausted |
-| `EmailSender` | **required** | e.g. `NewSMTPDispatcher` |
-| `WhatsAppSender` | **required** | e.g. `NewMetaCloudWhatsAppDispatcher` |
-| `EventBus` (`grevents.Bus`) | optional | receives `message.sent`/`message.failed` lifecycle events — nil-safe, always best-effort |
-| `Metrics` | optional | only `IncIdempotencyDedupHit`/`IncDLQPublished` — `Service` deliberately never calls `ObserveSendLatency`/`IncSendResult` itself, since the dispatcher already does when the same `Metrics` is wired into its own `Deps` |
-| `Config` (`ServiceConfig`) | optional | see below; zero value is upgraded to `DefaultServiceConfig()`'s values field-by-field |
-
-**`ServiceDeps` deliberately has no `RateLimiter` or `EmailTemplateEngine`
-field.** Rate limiting lives on `SMTPDispatcherDeps`/`MetaCloudDispatcherDeps`
-instead — `Service`'s own inline retry calls a dispatcher's `Send` more than
-once per logical send, so a second gate at the `Service` layer would
-silently double-consume tokens. Template rendering lives on
-`SMTPDispatcherDeps.TemplateEngine` — `Service` never sees a `TemplateName`,
-only the already-template-aware `EmailSender`.
-
-### `ServiceConfig` (via `DefaultServiceConfig()`)
-
-| Field | Default | Effect |
-|---|---|---|
-| `DefaultIdempotencyTTL` | `24h` | Used when `SendOptions.IdempotencyTTL` is zero |
-| `DefaultMaxRetryAge` | `24h` | Used when `SendOptions.RetryExpiresAt` is zero — a genuine guess, not derived from any real token TTL; **set `RetryExpiresAt` explicitly** to your message's real expiry (a reset link's TTL, an invite token's expiry) rather than relying on this |
-| `MaxInlineRetries` | `2` | Total attempts = `MaxInlineRetries + 1`, run inline on the caller's own goroutine before falling through to the DLQ |
-| `InlineRetryBaseDelay` / `InlineRetryMaxDelay` | `200ms` / `2s` | Feed `FullJitterBackoff` between inline retry attempts |
-
-### `SendOptions`
-
-| Field | Required? | Notes |
-|---|:---:|---|
-| `IdempotencyKey` | **required** | `Service.SendEmail`/`SendWhatsApp` return `ErrIdempotencyKeyRequired` if empty — grpop's retry is at-least-once, not exactly-once, so this is the only guarantee against a caller-visible double-send |
-| `IdempotencyTTL` | optional | 0 uses `ServiceConfig.DefaultIdempotencyTTL` |
-| `SkipRateLimit` | optional | escape hatch, e.g. an admin-triggered manual resend (dispatcher-level, only honored if the dispatcher itself checks it) |
-| `RetryExpiresAt` | optional | 0 uses `ServiceConfig.DefaultMaxRetryAge` measured from the first failure — set this to your message's real expiry when you know it |
-
-A delivery failure — even after inline retries are exhausted and the event
-has been DLQ'd — is reported via `SendResult.Status == SendStatusFailed`,
-**not** a non-nil `error` return. The `error` return is reserved for
-pipeline-level failures: a missing `IdempotencyKey`, a broken idempotency
-backend, or a permanent validation error (bad message shape) that would
-fail identically on every retry and therefore gets no DLQ entry, no
-lifecycle event, and no idempotency mark — you can fix the bug and resend
-with the exact same key.
+`RateLimiter` is `Allow(ctx context.Context, key string) (bool, error)`,
+exactly grsentry's `pkg/grlimiter.Limiter`, so its local or Redis limiter
+plugs in as it is. The two tiers catch different abuse: a sweep across many
+recipients, and many callers aiming at one. A refused send returns
+`ErrRateLimited` at once; a sender never waits for a token.
 
 ## Public API overview
 
@@ -252,6 +189,7 @@ with the exact same key.
 | Backend | Constructor |
 |---|---|
 | SMTP (any vendor) | `NewSMTPDispatcher(SMTPDispatcherDeps)` |
+| Resend's HTTP API | `NewResendDispatcher(ResendDispatcherDeps)` |
 | In-memory (tests/dev) | `NewMemoryEmailSender()` |
 | Dry run (staging, redacted logging) | `NewDryRunEmailSender(Logger)` |
 
@@ -262,27 +200,6 @@ with the exact same key.
 | Meta WhatsApp Business Cloud API | `NewMetaCloudWhatsAppDispatcher(MetaCloudDispatcherDeps)` |
 | In-memory (tests/dev) | `NewMemoryWhatsAppSender()` |
 | Dry run (staging, redacted logging) | `NewDryRunWhatsAppSender(Logger)` |
-
-**IdempotencyStore**
-
-| Backend | Constructor |
-|---|---|
-| Any `grcache.Cache` (Redis, Mongo, in-memory, ...) | `NewCacheIdempotencyStore(grcache.Cache)` |
-
-**DLQHandler**
-
-| Backend | Constructor |
-|---|---|
-| In-memory | `NewMemoryDLQHandler(maxRetries, retryDelay, maxRetryDelay, maxAttemptHistory)` |
-| PostgreSQL (`FOR UPDATE SKIP LOCKED`) | `NewPostgresDLQHandler(PostgresDLQHandlerConfig)` |
-| MongoDB (`findOneAndUpdate`) | `NewMongoDLQHandler(MongoDLQHandlerConfig)` |
-
-**RateLimiter** (two-tier: per-channel AND per-(channel,recipient))
-
-| Variant | Constructor |
-|---|---|
-| Local (per-process) | `NewLocalRateLimiter(requestsPerSecond, burstSize, recipientCacheSize int)` |
-| Redis (distributed, Lua-scripted) | `NewRedisRateLimiter(RedisRateLimiterConfig)` |
 
 **CircuitBreaker**
 
@@ -302,100 +219,160 @@ with the exact same key.
 |---|---|
 | Meta-backed, TTL-cached | `NewMetaTemplateValidator(MetaTemplateValidatorDeps)` |
 
-## Why this shape
+**WhatsAppCloudAPIClient** (the Graph API client both use)
 
-grpop is a single flat package, no subpackages — matching `grnoti`'s and
-`gourdiantoken`'s precedent rather than `grcache`'s/`graudit`'s
-subpackage-per-backend layout. That layout exists specifically to keep
-unused backend drivers out of a consumer's dependency graph; grpop's
-version of that tradeoff is unusually cheap, since the dispatch layer
-itself (the part most consumers actually exercise) has zero third-party
-dependencies to begin with — see [Dependencies](#dependencies). The only
-real multi-backend surface left is storage (Postgres/Mongo for the DLQ,
-Redis for the distributed rate limiter), a smaller version of the same
-tradeoff every sibling already accepts. See
-[docs/architecture.md](docs/architecture.md) for the full design rationale,
-and [docs/plan/grpop-plan.md](docs/plan/grpop-plan.md) for the original
-research and stage-by-stage build log.
+| Variant | Constructor |
+|---|---|
+| Meta's Graph API, `net/http` | `NewMetaCloudAPIClient(MetaCloudAPIClientConfig)` |
+
+To check templates before sending, build the client once and give it to
+both:
+
+```go
+client, err := grpop.NewMetaCloudAPIClient(grpop.MetaCloudAPIClientConfig{
+    PhoneNumberID:     os.Getenv("META_PHONE_NUMBER_ID"),     // to send
+    BusinessAccountID: os.Getenv("META_BUSINESS_ACCOUNT_ID"), // to list templates
+    AccessToken:       os.Getenv("META_ACCESS_TOKEN"),
+})
+validator, err := grpop.NewMetaTemplateValidator(grpop.MetaTemplateValidatorDeps{Client: client})
+sender, err := grpop.NewMetaCloudWhatsAppDispatcher(grpop.MetaCloudDispatcherDeps{
+    Client:            client,
+    TemplateValidator: validator,
+})
+```
+
+The validator lists the account's approved templates, every page, and keeps
+the list for its TTL (5 minutes). For each send it checks that the
+template is approved in that language and that the message fills what the
+template takes:
+- the header: text, media of the right kind, or a location;
+- the body: its count of values, or its names;
+- the buttons: each button that requires a value has one.
+
+A misfit is `ErrWhatsAppTemplateArityMismatch` saying what differs. The
+validator is advisory, and Meta decides:
+- when a listing fails, it checks against the last list it had, or lets the
+  send through when it has none;
+- a refusal is checked once more against a new listing (at most one listing
+  per 30 seconds), so a template approved a moment ago isn't refused for
+  long.
+
+**Helpers:** `FullJitterBackoff(base, max, attempt)` for a caller's retry
+loop.
 
 ## Error handling
 
 Sentinel errors (`errors.go`), matched with `errors.Is` — there is
 deliberately no `IsX(err) bool` helper, consistent with every other
-`gourdian25` repo. A backend-native error (`pgx.ErrNoRows`,
-`redis.Nil`, `mongo.ErrNoDocuments`, a Graph API error envelope) is always
-translated into one of these before crossing a grpop interface boundary,
-never leaked unwrapped:
+`gourdian25` repo.
 
-`ErrClosed`, `ErrBackendUnavailable`, `ErrIdempotencyKeyRequired`,
-`ErrRecipientRequired`, `ErrNoContentModeSet`, `ErrMultipleContentModesSet`,
-`ErrEmailTemplateNotFound`, `ErrInlineTemplateTooLarge`,
-`ErrEmailFromRequired`, `ErrEmailTemplateEngineRequired`,
-`ErrWhatsAppTemplateNameRequired`, `ErrWhatsAppLanguageCodeRequired`,
-`ErrWhatsAppTemplateNotApproved`, `ErrWhatsAppTemplateArityMismatch`,
-`ErrRateLimited`, `ErrDLQEventNotFound`, `ErrDLQEventNotClaimed`,
-`ErrCircuitOpen`, `ErrTooManyRequests`.
+**`ErrPermanent`** is the one a retry loop needs: every failure that will
+fail the same way on every attempt matches it, and nothing else does.
+
+- **Permanent:** the validation sentinels (`ErrRecipientRequired`,
+  `ErrNoContentModeSet`, `ErrMultipleContentModesSet`,
+  `ErrEmailTemplateNotFound`, `ErrInlineTemplateTooLarge`,
+  `ErrEmailFromRequired`, `ErrEmailTemplateEngineRequired`,
+  `ErrInvalidAddress`, `ErrWhatsAppTemplateNameRequired`,
+  `ErrWhatsAppLanguageCodeRequired`, `ErrWhatsAppTemplateNotApproved`,
+  `ErrWhatsAppTemplateArityMismatch`, `ErrInvalidPhoneNumber`,
+  `ErrWhatsAppParameterInvalid`), a template that won't render, an SMTP
+  `5xx` reply (a mailbox that doesn't exist, a refused sender, bad
+  credentials), and a Meta refusal of the request, the account or the
+  template.
+- **Temporary:** `ErrRateLimited`, `ErrCircuitOpen`, `ErrTooManyRequests`,
+  an SMTP `4xx` reply, a dial, TLS or network failure, a timeout, a
+  cancelled context, a Meta `429` or `5xx`, and Meta's retry-later codes (2,
+  4, 80007, 130429, 131000, 131016, 131056, 133004, 2494100).
+
+**`EmailMessage.IdempotencyKey`** (optional) is the same value on every
+attempt at one message, an outbox row's id say. The Resend sender sends it as
+Resend's `Idempotency-Key` header, so Resend sends a retried message once
+within 24 hours (a key over 256 characters goes as its SHA-256). The SMTP
+sender makes the `Message-ID` its SHA-256 (the key itself never appears in
+the message), so a retried message carries the same `Message-ID`; SMTP can
+do no more than that. Never give two different messages one key.
+
+The Resend sender classes Resend's refusals by its error reference: a `429`
+(the rate limit and the daily and monthly quotas), a `5xx`, and a `409` for a
+request with the same key still running are temporary; every other refusal
+(an invalid field or key, an unverified sender domain, the same key with a
+different body) is permanent.
+
+`ErrInvalidAddress` covers a `From`, `To` or `Reply-To` that `net/mail` can't
+parse or that carries a line break (which would add a header of its own); it
+names the field, never the value. Display names are fine
+(`"Acme <no-reply@acme.test>"`): the headers carry them, `MAIL FROM` and
+`RCPT TO` the bare addresses. Logs show an address masked
+(`a***@example.com`), including inside an SMTP reply that echoes it.
 
 ## Limitations / out of scope
 
 - **SendStatusSent means "the vendor accepted the request," never
   "arrived" or "was read."** grpop has no vendor-side bounce/complaint/
   delivery-receipt feedback for either channel.
-- **Retries are at-least-once, not exactly-once.** A network error after
-  the vendor already accepted a send is indistinguishable from one before —
-  this is why `SendOptions.IdempotencyKey` is required, not optional.
-- **No message broker or queue anywhere in this package.** Every `Send`
-  call is direct and synchronous on the caller's goroutine; `DLQHandler`'s
-  table is a durable, pull-based retry store a consumer's own worker polls,
-  never a transport a send passes through.
+- **A caller's retry is at-least-once, not exactly-once.** A network error
+  after the vendor already accepted a send is indistinguishable from one
+  before, and the SMTP sender can't be cancelled mid-transaction (a timed-out
+  send's goroutine is abandoned and may still deliver).
+- **No message broker, queue or store anywhere in this package.** Every
+  `Send` is direct and synchronous on the caller's goroutine.
 - **SMS is not supported, and never was in scope for this design** — see
   `docs/plan/grpop-plan.md`'s revision note for the reasoning (dependency
   minimization; WhatsApp/email cover the four grounding use cases).
   Multi-recipient email (`EmailMessage.To []string`) is also cut: a real
   SMTP transaction can partially fail per-recipient in a way `SendResult`
   has no room to represent, so send once per recipient instead.
-- **WhatsApp has no local test emulator.** Unlike Postgres/Mongo/Redis/
-  Mailpit, which are all tested against real local instances, the Meta
-  Cloud API client is tested against a hand-rolled fake `WhatsAppCloudAPIClient`
-  — there is no equivalent "run it locally" option.
-- **`grpop_dlq` stores full send payloads — including secrets like reset
-  links or invite tokens — in the clear unless a `MessageEncryptor` is
-  configured.** Absent one, operate it with credentials-table-grade access
-  control.
+- **WhatsApp has no local test emulator.** The Meta Cloud API client is
+  tested against a fake `WhatsAppCloudAPIClient` and an `httptest` server.
+- **A WhatsApp message's checks are Meta's documented send-time rules (read
+  2026-10-24), not a promise Meta will accept it.** Meta stays the
+  authority: a message that passes can still be refused (an unknown
+  template, a wrong count of values), and a rule Meta adds later is only
+  Meta's refusal until grpop learns it.
+- **`TemplateValidator` is advisory, with a 30-second window both ways.** A
+  since-revoked template can look approved until the next listing (Meta
+  then refuses the send). A template approved or edited in the last 30
+  seconds can be refused by a permanent error, since a refusal gets at most
+  one new listing per 30 seconds. A failed listing never blocks a send.
 - **grpop never refreshes or rotates a Meta access token.** Token lifecycle
   is entirely the operator's responsibility.
+- **Meta retires a Graph API version about two years after release.**
+  `MetaCloudDispatcherDeps.GraphAPIVersion` defaults to `v26.0` (released
+  2026-07-29); set it to move ahead of grpop's default.
 - **`CircuitBreaker` state is per-process, deliberately not centralized** —
   avoids a synchronized thundering-herd retry the moment a relay recovers.
-- **Postgres schema management is additive only** — every `New*Postgres*`
-  constructor applies `CREATE TABLE/INDEX IF NOT EXISTS` on connect; no
-  down-migration, no versioning. Set `PostgresConfig.SkipSchemaEnsure: true`
-  once you own the schema via your own migration tool.
 
 See [docs.go](docs.go)'s "Precise, non-aspirational claims" section for the
 complete list this draws from.
 
 ## Testing
 
-Real local Docker containers for every storage backend — no mocking. See
-[CLAUDE.md](CLAUDE.md) for exact `docker run` commands, or just:
+The SMTP sender's integration test runs against a real local Mailpit (it
+skips when Mailpit is down, which drops coverage below the 95% gate). The
+Resend sender is tested against a local fake of its API; one live test sends
+to Resend's `delivered@resend.dev` only when `GRPOP_TEST_RESEND_API_KEY` is
+set (`GRPOP_TEST_RESEND_FROM` picks the sender, default
+`onboarding@resend.dev`). The WhatsApp sender, the listing and the validator
+are tested against local fakes of Meta's API. One live test sends Meta's
+`hello_world` sample template only when `GRPOP_TEST_META_PHONE_NUMBER_ID`,
+`GRPOP_TEST_META_ACCESS_TOKEN` and `GRPOP_TEST_META_TO` (a number the account
+may message) are set. With `GRPOP_TEST_META_BUSINESS_ACCOUNT_ID` set as well,
+it first lists the account's templates and validates the send.
 
 ```sh
-make docker-up   # Postgres, Redis, Mongo (replica set + auth), Mailpit
+make docker-up   # Mailpit
 make test        # or `make race` for the race detector
-make docker-down # stop them when done (state preserved for a fast restart)
+make docker-down # stop it when done
 ```
 
 ## Development
 
 ```sh
-make docker-up   # start the shared test containers
+make docker-up   # start Mailpit
 make precommit   # fmt + vet + lint + race + coverage-check
-make docker-down # stop them when you're done
+make docker-down # stop it when you're done
 ```
-
-These containers are shared with `graudit`, `grcache`, `grnoti`, and
-`gourdiantoken` (each gets its own database/keyspace) — Mailpit is
-grpop-specific, no sibling repo needs it.
 
 ## Contributing
 

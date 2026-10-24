@@ -114,6 +114,9 @@ func TestEmailTemplateEngine_Render_ExecutionError(t *testing.T) {
 			if err == nil {
 				t.Fatal("Render(execution error) = nil error, want non-nil")
 			}
+			if !errors.Is(err, ErrPermanent) {
+				t.Fatalf("Render(execution error) = %v, want it to match ErrPermanent (the same data fails every time)", err)
+			}
 		})
 	}
 }
@@ -163,6 +166,9 @@ func TestEmailTemplateEngine_RenderInline_InvalidSyntax(t *testing.T) {
 	_, _, _, err := e.RenderInline(EmailTemplate{SubjectTemplate: "{{.Unclosed"}, nil)
 	if err == nil {
 		t.Fatal("RenderInline(invalid template syntax) = nil error, want non-nil")
+	}
+	if !errors.Is(err, ErrPermanent) {
+		t.Fatalf("RenderInline(invalid template syntax) = %v, want it to match ErrPermanent", err)
 	}
 }
 

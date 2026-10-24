@@ -8,227 +8,242 @@ account). It is a design reference, not a tutorial — see the
 [README](../README.md) for a quickstart and
 [example/main.go](../example/main.go) for a runnable, narrated walkthrough.
 
+## 0. Delivery only (0.2.0, 2026-10-23)
+
+grpop sends one message once and reports what the vendor said; it keeps
+nothing and retries nothing. Up to 0.1.0 it also had an orchestrating
+`Service` (an idempotency check, an inline retry, a dead-letter retry table
+in memory, Postgres or Mongo, an optional payload encryptor, lifecycle
+events on grevents) and its own two-tier rate limiters (in-process, and a
+Lua-scripted Redis one). Those were removed for grsentry's email work
+([plan/2026-10-23-grpop-delivery-only.md](plan/2026-10-23-grpop-delivery-only.md)):
+
+- **Retry, durability and duplicates belong to the caller.** Only the
+  caller knows the transaction a message belongs to and how long its link
+  stays valid, and only a store written in that transaction (an outbox) can
+  promise a committed message is never lost. A dead-letter table that only
+  catches a send after its in-memory retries failed can't: a crash during
+  those retries lost the message. Code review on 2026-10-23 also found the
+  removed layer could lose a message outright (a failed dead-letter write
+  still marked the key processed), left a crashed worker's claimed row
+  `retrying` forever (no lease), raced its duplicate check, and refused an
+  email-only setup.
+- **No rate limiter of grpop's own.** `RateLimiter` is
+  `Allow(ctx, key) (bool, error)`, grsentry's `pkg/grlimiter.Limiter`'s
+  method set, so that limiter plugs in without an import either way (grpop
+  importing grsentry would make the two modules require each other).
+
+`FullJitterBackoff` stays, exported, for the caller's retry loop. The
+sections below describe what is left; the removed parts' design is in git
+history and in [plan/grpop-plan.md](plan/grpop-plan.md).
+
 ## 1. Package shape
 
-grpop's public API is a single flat package with no subpackages — every
-storage backend (PostgreSQL, MongoDB, Redis) and every vendor dispatcher
-lives in this one module:
+grpop's public API is a single flat package with no subpackages and no
+third-party dependencies:
 
 ```
 interfaces.go / types.go / errors.go / logger.go / docs.go
 retrystrategy.go            circuitbreaker.go           payloadvalidator.go
+ratelimiter.go (the shared two-limiter check)
 templateengine.email.go
-cache.idempotency.go        ratelimiter.go (local)       ratelimiter.redis.go
-postgres.go                 dlq.postgres.go              dlq.mongo.go
 dispatcher.email.smtp.go    dispatcher.whatsapp.metacloud.go
 templatevalidator.whatsapp.go
-dryrun.go                   events.go                    service.go
-memory.go (in-memory variant of every store)
-internal/postgresdb/        (sqlc-generated, unexported — see §5)
+dryrun.go                   memory.go (in-memory senders)
 example/
 ```
 
-File naming: `<concern>.<backend>.go` for storage/rate-limiting (matching
-`grnoti`), `dispatcher.<channel>.<vendor>.go` for the two dispatch files —
-a third segment, since grpop's dispatch layer has a genuinely
-two-dimensional axis (channel × vendor) that `grnoti`'s single-channel,
-single-vendor dispatch layer didn't need.
+File naming: `dispatcher.<channel>.<vendor>.go` for the senders — a third
+segment, since grpop's dispatch layer has a genuinely two-dimensional axis
+(channel × vendor) that `grnoti`'s single-channel, single-vendor dispatch
+layer didn't need. Email goes over stdlib `net/smtp`; WhatsApp goes over a
+hand-rolled `net/http` client against Meta's Graph API (no official Go SDK
+exists). See `docs.go`'s package-level doc comment.
 
-**This follows `grnoti`'s/`gourdiantoken`'s precedent, not
-`grcache`'s/`graudit`'s subpackage-per-backend layout** (which exists
-specifically to keep unused backend drivers out of a consumer's dependency
-graph). grpop's version of that tradeoff is unusually cheap: the dispatch
-layer itself — the part most consumers actually touch — has **zero
-third-party dependencies**, full stop. Email goes over stdlib `net/smtp`;
-WhatsApp goes over a hand-rolled `net/http` client against Meta's Graph API
-(no official Go SDK exists regardless of channel scope). The only
-third-party imports anywhere in the module are for storage/rate-limiting
-(`pgx/v5`, `go-redis/v9`, optionally `mongo-driver`) and `grcache`'s/
-`grevents`' own root-interface packages. See `docs.go`'s package-level doc
-comment and `docs/plan/grpop-plan.md` §3 for the full reasoning.
+## 2. Interfaces and implementations
 
-## 2. Interfaces and backend matrix
-
-| Interface | In-memory (`memory.go`) | Postgres | Mongo | Redis | Other |
-|---|:---:|:---:|:---:|:---:|---|
-| `EmailSender` | `MemoryEmailSender` | — | — | — | `smtpDispatcher` (stdlib SMTP, any vendor); `dryRunEmailSender` (staging) |
-| `WhatsAppSender` | `MemoryWhatsAppSender` | — | — | — | `metaCloudDispatcher` (Meta Graph API, direct); `dryRunWhatsAppSender` (staging) |
-| `IdempotencyStore` | — | — | — | — | `cacheIdempotencyStore` — thin adapter over any `grcache.Cache` (Redis, Mongo, in-memory, ...) |
-| `DLQHandler` | `memoryDLQHandler` | `postgresDLQHandler` (`FOR UPDATE SKIP LOCKED`) | `mongoDLQHandler` (`findOneAndUpdate`) | — | |
-| `RateLimiter` | — | — | — | `redisRateLimiter` (Lua-scripted, two-tier) | `localRateLimiter` (per-process, two-tier) |
-| `CircuitBreaker` | — | — | — | — | `standardCircuitBreaker` — the one implementation, returned as the interface type |
-| `EmailTemplateEngine` | — | — | — | — | `defaultEmailTemplateEngine` (`html/template` + `text/template`) |
-| `TemplateValidator` | — | — | — | — | `metaTemplateValidator` — TTL-cached over `WhatsAppCloudAPIClient.GetApprovedTemplates` |
-| `WhatsAppCloudAPIClient` | — | — | — | — | `metaCloudAPIClient` (real, `net/http`); fake in tests — Meta's Graph API has no local emulator (§5) |
-
-`Service` (`service.go`) is the orchestrator composing `IdempotencyStore` +
-`DLQHandler` + both `Sender`s via `ServiceDeps`; see §3.4 for what it
-deliberately does *not* also hold.
+| Interface | Implementations |
+|---|---|
+| `EmailSender` | `smtpDispatcher` (stdlib SMTP, any vendor); `dryRunEmailSender` (staging); `MemoryEmailSender` (tests) |
+| `WhatsAppSender` | `metaCloudDispatcher` (Meta Graph API, direct); `dryRunWhatsAppSender` (staging); `MemoryWhatsAppSender` (tests) |
+| `RateLimiter` | none: the caller's (grsentry's `pkg/grlimiter` fits as it is) |
+| `CircuitBreaker` | `standardCircuitBreaker` — the one implementation, returned as the interface type |
+| `EmailTemplateEngine` | `defaultEmailTemplateEngine` (`html/template` + `text/template`) |
+| `TemplateValidator` | `metaTemplateValidator` — TTL-cached over `WhatsAppCloudAPIClient.GetApprovedTemplates` |
+| `WhatsAppCloudAPIClient` | `metaCloudAPIClient` (real, `net/http`, `NewMetaCloudAPIClient`; one serves a sender and a validator); fake in tests — Meta's Graph API has no local emulator (§5) |
 
 ## 3. Key design decisions
 
-### 3.1 Two-tier rate limiting: per-channel AND per-(channel, recipient)
+### 3.1 Two rate limiters, both the caller's: per channel and per recipient
 
-`RateLimiter.Allow`/`Wait` gate on **both** a per-`Channel` bucket and a
-per-`(Channel, recipient)` bucket, requiring both to have capacity — a
-deliberate divergence from `grnoti`'s single global bucket. A
-per-recipient limit alone can't stop one actor from triggering many
-distinct recipients' sends in a burst (a scripted forgot-password sweep
-across a whole user list); a per-channel limit alone can't stop one
-recipient from being spammed by many distinct callers. Composing two
-independent `golang.org/x/time/rate.Limiter`s into one atomic decision is
-the real subtlety in `localRateLimiter.Allow`: `rate.Limiter` has no "peek
-without consuming" operation, so `Allow` uses `Reserve` (which always
-commits) and explicitly `Cancel`s the channel-level reservation if the
-recipient-level check then fails — otherwise a request rejected on the
-recipient tier would still have silently spent a channel-level token.
-`redisRateLimiter` gets the equivalent atomicity from a single Lua script
-touching both `KEYS[]` entries in one round trip, computing `now` via
-`redis.call("TIME")` server-side (not a client-supplied timestamp — see
-§4 for why that mattered).
+A sender takes two optional `RateLimiter`s: `RateLimiter`, keyed by the
+channel alone, and `RecipientRateLimiter`, keyed by the channel and a
+SHA-256 of the recipient (so the limiter's backend never stores an address
+or number). A per-recipient limit alone can't stop one actor from
+triggering many distinct recipients' sends in a burst (a scripted
+forgot-password sweep across a whole user list); a per-channel limit alone
+can't stop one recipient from being spammed by many distinct callers.
+`checkRateLimits` asks the recipient's first, so a send one recipient's
+bucket refuses spends nothing from the channel's. A refusal is
+`ErrRateLimited` at once (a sender never waits for a token: the caller's
+retry spaces it out), and a limiter that errors stops the send (fail
+closed).
 
-### 3.2 `ExpiresAt`/`DLQStatusExpired`: a retry deadline independent of `MaxRetries`
+### 3.2 Rate limiting and template rendering live on the senders
 
-`DLQHandler` retries are bounded by a hard wall-clock deadline
-(`DLQMessage.ExpiresAt`), not just a retry-count ceiling. A retry-count
-ceiling alone assumes every failure is equally worth retrying no matter how
-much wall-clock time has passed — true for a generic delivery failure, but
-not for grpop's actual payloads: a password-reset link or invite token is
-itself time-boxed, independent of grpop, so retrying a send for five more
-hours past that point doesn't help the recipient, it just spends vendor
-budget delivering a message that's already useless.
+Both gate or shape every individual `Send`: the limiters and the circuit
+breaker on `SMTPDispatcherDeps`/`MetaCloudDispatcherDeps`, and template
+rendering on `SMTPDispatcherDeps.TemplateEngine`, since content-mode
+resolution (`TemplateName`/`InlineTemplate`/literal) has to happen
+immediately before the MIME message is built.
 
-`ClaimRetryableEvents` runs two steps every call: (1) a plain bulk
-transition of any `DLQStatusPending` event whose deadline has already
-passed to `DLQStatusExpired` — no cross-replica coordination needed, since
-a second attempt on an already-expired row matches zero rows; (2) the
-actual atomic claim (`FOR UPDATE SKIP LOCKED` in Postgres, a
-`findOneAndUpdate` loop in Mongo), with an added `expires_at > now()`
-predicate so a row can never be claimed past its own deadline.
-`MarkRetried` checks the expiry-vs-`MaxRetries` ordering deliberately:
-**expiry is checked before exhaustion**, so a message that expires with
-retry budget still unused is reported as `DLQStatusExpired`, not
-`DLQStatusExhausted` — the two are different failure modes worth
-distinguishing in monitoring (`Exhausted` suggests a vendor-side problem
-worth alerting on; `Expired` is expected/benign).
+Every sender calls its vendor through `executeThroughBreaker`, with the
+send function returning the already-classified error. That helper lets the
+breaker count only a temporary failure. A permanent one is about the
+message (a mailbox that doesn't exist, a template Meta refuses), and the
+vendor did answer, so the breaker records it as a success and the error
+comes back unchanged (decided 2026-10-24). Counted as failures, a run of
+bad addresses would open the breaker and hold back the good messages
+behind them. This is why the SMTP sender classes a `5xx` inside the send
+function, not after the breaker.
 
-This state machine was built first in `memoryDLQHandler` (Stage 3) and
-repeated in SQL/Mongo afterward — two real cross-backend bugs surfaced and
-got fixed doing so: Postgres's `expires_at` column started `NOT NULL`
-(rejecting the "zero = no deadline" contract `memory.go` established) and
-had to become nullable with explicit `IS NULL OR ... >` handling in the
-claim query; the encrypted-payload path needed base64-wrapping before
-Postgres's JSONB column would accept it, since raw ciphertext isn't valid
-UTF8 (Mongo's BSON binary type has no such restriction, so its equivalent
-path stores ciphertext directly).
+### 3.3 A failure is the returned error, and says whether to retry
 
-### 3.3 Rate limiting and template rendering live at the dispatcher layer, not `Service`
+`Send` returns `(SendResult{Status: SendStatusFailed}, err)` for a failed
+attempt and `(result, nil)` for an accepted one; there is no second channel
+for "failed but handled". `errors.Is(err, ErrPermanent)` tells a caller's
+retry to stop (0.2.0, P2): every validation sentinel is built with
+`permanent`, so it matches `ErrPermanent` and still itself, and a sender
+wraps a vendor's final refusal the same way, keeping its message and chain
+(`errors.As` still finds the `*textproto.Error`). SMTP: a `5xx` reply is
+permanent, a `4xx` and every transport failure temporary. Meta: its
+retry-later codes (read from its error reference, listed in
+`metaTemporaryErrorCodes`), a `429` and a `5xx` are temporary, every other
+refusal permanent. The circuit breaker still counts every failure, a
+permanent one included.
 
-`ServiceDeps` (`service.go`) has **no `RateLimiter` field and no
-`EmailTemplateEngine` field** — both were considered for `Service` during
-Stage 15 and rejected in favor of keeping them where Stage 10/11 had
-already wired them:
+### 3.4 One preparation step for every email sender
 
-- **RateLimiter**: `SMTPDispatcherDeps.RateLimiter`/
-  `MetaCloudDispatcherDeps.RateLimiter` already gate every individual
-  `Send` call. `Service`'s own inline retry (§3.4) calls a dispatcher's
-  `Send` more than once per logical send — a second gate at the `Service`
-  layer would silently consume two-to-four tokens for one logical send,
-  with neither layer aware of the other's consumption. Rate limiting is
-  dispatcher-layer-only, and this incidentally resolves
-  `ratelimiter.redis.go`'s own fail-open/fail-closed question (deferred to
-  "Service, Stage 15" in an earlier doc comment): the dispatcher's
-  `Wait`-then-error-on-failure wiring already **is** that decision —
-  fail-closed — made at construction time, not by `Service` at all.
-- **EmailTemplateEngine**: template rendering was moved into
-  `dispatcher.email.smtp.go` itself during Stage 10
-  (`SMTPDispatcherDeps.TemplateEngine`), since content-mode resolution
-  (`TemplateName`/`InlineTemplate`/literal) has to happen immediately
-  before the MIME message is built — `Service` never sees a template name,
-  only an `EmailSender` that already knows how to render one.
+`prepareEmail` (`dispatcher.email.go`, 0.2.0 P3) is the only path from an
+`EmailMessage` to what a vendor is sent: check it (`validateEmailMessage`),
+render its one content mode (`renderEmailContent`), apply the default
+sender, parse `From`, `To` and `Reply-To`. Every email sender builds its
+request from the `preparedEmail` it returns, so two vendors send the same
+message for the same input and refuse the same ones, with the same
+permanent errors. It also carries `EmailMessage.IdempotencyKey`: a vendor
+with idempotency gets it as is; the SMTP sender makes the `Message-ID` the
+key's SHA-256 at the sender's domain (`smtpMessageID`), the same on every
+attempt and never the key itself.
 
-### 3.4 `Service`'s pipeline: idempotency → inline retry → permanent/transient classification → DLQ → lifecycle event
+### 3.5 Resend: a hand-rolled client, idempotent, classed by its error reference
 
-```
-IdempotencyKey required
-  → IsProcessed check (fail closed on a store error — see below)
-  → inline-retried Send (FullJitterBackoff, docs.go: no broker, so this
-     retry runs synchronously on the caller's own goroutine)
-  → permanent vs. transient failure classification (isPermanentSendError)
-  → [transient only] PublishToDLQ
-  → best-effort lifecycle event (message.sent / message.failed)
-  → MarkProcessed (unconditionally, once Service is done with this key)
-```
+`NewResendDispatcher` (`dispatcher.email.resend.go`, 0.2.0 P4) posts one
+`POST /emails` per send, `net/http` and `encoding/json` only, like the Meta
+client: grpop takes no vendor SDK, and the SDK would add nothing to one POST.
+It builds the body from `prepareEmail`, so it sends what the SMTP sender
+would. `EmailMessage.IdempotencyKey` goes as Resend's `Idempotency-Key`
+(1 to 256 characters, kept 24 hours; a longer key as its SHA-256 hex), which
+makes a caller's retry safe within that window. Resend's reply is
+`{"id"}` on success and `{"message","name","statusCode"}` on a refusal (seen
+on 2026-10-24 with a request that carried no key). `resendErrorIsTemporary`
+classes a refusal from Resend's error reference: `429` (the per-second limit
+and the daily and monthly quotas), `5xx`, and a `409` other than
+`invalid_idempotent_request` are temporary; everything else is permanent.
+Addresses go as Resend's docs write them (`Name <address>`, quoted only when
+the name needs it, never RFC 2047-encoded, since the body is JSON). The API
+key is in the `Authorization` header and nowhere else.
 
-Two behaviors worth calling out because they're easy to get backwards on a
-re-read of `service.go`:
+### 3.6 Addresses are parsed, and logged masked
 
-- **A delivery failure is reported via `SendResult.Status`, not the
-  returned `error`.** `SendEmail`/`SendWhatsApp` return `(result, nil)` even
-  after inline retries are exhausted and the event has been DLQ'd — mirrors
-  `grnoti`'s own `processEvent` precedent exactly (a `dispatchErr` is
-  logged, never propagated; the final return is unconditional). The `error`
-  return is reserved for pipeline-level failures: a missing
-  `IdempotencyKey`, a broken idempotency store, or a permanent validation
-  error.
-- **Permanent (validation-shaped) errors are classified before retry or
-  DLQ**, via `errors.Is` against grpop's own construction/validation
-  sentinels (`ErrRecipientRequired`, `ErrNoContentModeSet`, `ErrEmailFromRequired`,
-  `ErrWhatsAppTemplateNotApproved`, ...). These get zero inline retries
-  (retrying a malformed message is pointless — it fails identically every
-  time), zero DLQ entries (a DLQ entry that can never succeed just wastes a
-  dashboard-visible slot), zero lifecycle events, and critically **no
-  idempotency mark** — the caller can fix their bug and resend with the
-  exact same key rather than being silently blocked by a false "duplicate."
-  Everything else (network errors, vendor 5xx, circuit-breaker rejections)
-  is transient: retried inline, DLQ'd on exhaustion, idempotency key marked
-  processed either way (a caller-side redelivery of the same key must not
-  re-trigger a parallel attempt once the failure has been handed to the
-  DLQ for its own retry cycle).
+`From`, `To` and `Reply-To` go through `net/mail.ParseAddress`
+(`parseEmailAddress`), and a CR or LF anywhere is refused first: written
+into a header unchecked, a line break let `Reply-To` add a `Bcc` line
+(found 2026-10-23; `MAIL FROM` and `RCPT TO` were safe only because
+`net/smtp` refuses line breaks there). The headers carry the parsed form (a
+display name quoted or Q-encoded), the envelope and the recipient's
+rate-limit key the bare address, and a bad `DefaultFrom` fails at
+construction. Log lines carry `maskEmail`'s `a***@example.com`, and an SMTP
+reply that echoes an address is masked before it is logged.
 
-**`IsProcessed` failing fails closed, not open.** `SendOptions.IdempotencyKey`
-exists specifically to prevent a caller-visible double-send; a broken
-idempotency backend silently proceeding as "not yet processed" is exactly
-the failure mode the key exists to prevent, so a store error blocks the
-send entirely rather than risking it.
-
-### 3.5 The Meta Cloud API client: hand-rolled, narrow, fake-tested
+### 3.7 The Meta Cloud API client: hand-rolled, narrow, fake-tested
 
 `WhatsAppCloudAPIClient` is grpop's own thin interface over two Graph API
 endpoints (`SendTemplateMessage`, `GetApprovedTemplates`) — no official Go
 SDK exists for WhatsApp regardless of vendor, so a hand-rolled `net/http` +
 `encoding/json` client (`metaCloudAPIClient`) was always required. Sending
 uses `PhoneNumberID`; listing approved templates (which backs
-`TemplateValidator`, §3.6) needs the WhatsApp Business Account ID instead —
+`TemplateValidator`, §3.8) needs the WhatsApp Business Account ID instead —
 a separate ID Meta assigns, added to `MetaCloudDispatcherDeps` as
 `BusinessAccountID` during implementation once this distinction became
 concrete (the original plan draft didn't separate the two IDs). This is
 the **one deliberate exception** to grpop's real-local-backend testing
 policy: Meta's Graph API has no local emulator, so `metaCloudDispatcher`'s
-own retry/rate-limiter/circuit-breaker wiring is tested against a fake
+own rate-limiter/circuit-breaker wiring is tested against a fake
 `WhatsAppCloudAPIClient`, and the real HTTP client's own request-building/
 auth-header/error-envelope-parsing logic is separately tested against a
-real local `httptest.Server` (not Meta itself, but a real HTTP round trip).
+real local `httptest.Server` (not Meta itself, but a real HTTP round trip). Every call names `GraphAPIVersion` (default
+`v26.0`; Meta retires a version about two years after release, and the
+earlier hard-coded `v20.0` stopped on 2026-09-24).
 
-### 3.6 `TemplateValidator`: advisory, TTL-cached, never a false negative
+A `WhatsAppMessage` fills its template with typed values (since 0.2.0,
+replacing `TemplateVariables map[string]string`, which carried only
+positional body text and silently cut the list at a gap in its keys):
 
-Meta requires every WhatsApp template to go through approval before use;
-`TemplateValidator.Validate` checks both approval status and that
-`TemplateVariables`' count matches the approved template's expected
-parameter count (`WhatsAppTemplateInfo.ParameterCount`, parsed from the
-approved template body's `{{1}}`, `{{2}}`, ... placeholder count) —
-catching the two most common vendor-rejection causes before a live send is
-attempted. The cache (default 5 minute TTL, refreshed lazily on a stale
-`Validate` call or eagerly via `Refresh`) means "approved as of the last
-check," not a live guarantee — Meta can approve, reject, or delete a
-template between grpop's last refresh and a live send. This is accepted
-because the vendor call itself remains the ultimate source of truth: a
-passed `Validate` check never causes `Send` to skip actually calling Meta,
-so the cache can only ever produce a false *positive* window (a
-since-revoked template briefly still looks approved), never a false
-negative that blocks a send that would have succeeded.
+- `Header`: text, image, video, document or location;
+- `Body`: text, currency or date and time, positional or named, never mixed;
+- `Buttons`: a URL suffix, a quick-reply payload, a coupon code or a
+  one-time code, each by its index.
 
-### 3.7 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
+The real client turns them into Meta's `components`. A button carries its
+`sub_type` and a string `index`, and a one-time code goes as the `url`
+sub_type, sent twice (body and button 0) as Meta's copy-code and one-tap
+authentication templates require. `WhatsAppOTP` builds that pair.
+
+`validateWhatsAppMessage` refuses, before any call, what Meta's send-time
+rules refuse (read 2026-10-24). The tests pin the exact JSON of every kind
+against an `httptest` server.
+
+### 3.8 `TemplateValidator`: advisory, TTL-cached, a short false-negative window
+
+Meta requires every WhatsApp template to go through approval before use.
+`TemplateValidator.Validate` checks that the template is approved in the
+message's language, and that the message fills what it takes
+(`WhatsAppTemplateInfo`, read from Meta's listing):
+- a text header's placeholder, by name in a named template; media of the
+  header's kind; a location;
+- the body's placeholders, by count or by name (counted with a regexp, so
+  `{{25}}` and `{{first_name}}` count; until 0.2.0 counting stopped at
+  `{{20}}` and missed names);
+- every button that requires a value (a URL with a placeholder, a coupon, a
+  one-time code). Meta lists a created one-time-code button as a `URL`, so
+  an OTP button fits one.
+
+That catches the commonest refusals before a live send.
+
+**The listing** pages by Meta's cursor to the end (until 0.2.0 it read one
+page, so a template past it read as unapproved). It asks for
+`status=APPROVED` and filters again itself. It never fetches the
+`paging.next` URL: the access token goes only to the configured host. A
+repeated cursor, or more than 100 pages of 100, is an error rather than a
+cut-off list.
+
+**The cache** (default 5 minute TTL, refreshed lazily on a stale `Validate`
+call or eagerly via `Refresh`) means "approved as of the last check," not a
+live guarantee. The validator stays advisory, and Meta is the authority:
+- a failed listing never blocks a send (until 0.2.0 it did): it checks
+  against the last list it had, or lets the send through when it has none;
+- after a failure it lists again only after 30 seconds, so a Meta outage
+  costs one listing per 30 seconds, not one per send;
+- a refusal is checked once more against a new listing before it is
+  returned, at most one listing per 30 seconds.
+
+So a since-revoked template can briefly look approved (a false positive,
+and Meta's own refusal follows). A template approved or edited in the last
+30 seconds can be refused (a false negative). That window is the cost of
+not listing on every refusal, and a passed check never skips the call to
+Meta.
+
+### 3.9 SMTP: zero dependencies, a narrow fakeable client, timeout-by-goroutine-race
 
 `SMTPClient` (`Auth`/`Mail`/`Rcpt`/`Data`/`Close`) is satisfied directly by
 `*net/smtp.Client` — no adapter type needed. `SMTPDialer.Dial` performs the
@@ -250,52 +265,21 @@ worse.
 
 ## 4. Notable bugs caught before they shipped
 
-Two classes of bug were caught by empirical verification against real
-backends before being wired into Go code, consistent with this repo's
-"verify against the real thing, not an assumption" practice:
-
-- **Postgres JSONB + `MessageEncryptor`**: `MessageEncryptor`-produced
-  ciphertext isn't valid UTF8; writing it directly to the JSONB
-  `message_data` column failed with `invalid byte sequence for encoding
-  "UTF8"`. Fixed by base64-wrapping ciphertext as a JSON string scalar.
-- **A pasted 5-point external code review of `ratelimiter.redis.go`**,
-  independently verified point-by-point rather than accepted blindly — all
-  five were confirmed real and fixed: a client-supplied clock (replaced
-  with `redis.call("TIME")`, verified empirically to work inside a Lua
-  script against real Redis — Redis 5+'s effects-based replication removed
-  the older restriction on non-deterministic commands like `TIME` inside
-  `EVAL`), unhashed recipient identifiers in Redis key names (SHA-256'd to
-  remove delimiter-injection risk), `Wait`'s unjittered fixed poll interval
-  (jittered), an undocumented fail-open/fail-closed policy (documented, and
-  ultimately resolved at the dispatcher layer — see §3.3), and an unchecked
-  type assertion on the Lua script's return value (made safe).
+Up to 0.1.0, two classes of bug in the since-removed storage layer were
+caught by empirical verification against real backends: ciphertext written
+straight to a Postgres JSONB column (fixed by base64-wrapping), and five
+points of an external review of the Redis rate limiter (a client-supplied
+clock, unhashed recipient keys, an unjittered poll, an undocumented
+fail-open/fail-closed policy, an unchecked type assertion). The hashed
+recipient key and the fail-closed policy carry over to `checkRateLimits`
+(§3.1).
 
 ## 5. Testing philosophy and coverage
 
-Every storage backend is tested against a **real local Docker container** —
-Postgres, MongoDB (replica set + auth), Redis, and Mailpit (SMTP) — never a
-mock, via `contract_*_test.go` shared behavioral suites plus per-backend
-test files, `t.Skip`-ing when the corresponding container isn't reachable.
-`-race` is mandatory. The Meta Cloud API client is the one documented
-exception (§3.5).
-
-`internal/postgresdb` (sqlc-generated query code) is excluded from the
-coverage target the same way `grnoti`'s does — it's exercised indirectly,
-at high volume, by every `dlq.postgres_test.go`/contract test that runs
-against a real Postgres container, but Go's default per-package coverage
-accounting only attributes coverage to a package that has its own test
-files, so its standalone number reads as near-zero regardless of how
-thoroughly it's actually exercised. `make coverage-check` measures the root
-package only (`go test -cover .`), which is where nearly all of grpop's own
-logic — as opposed to sqlc's generated SQL-parameter marshaling — actually
-lives.
-
-A small number of defensive branches remain genuinely uncovered by design,
-not oversight — e.g. `golang.org/x/time/rate.Reservation.OK()` returning
-false is only possible when requesting more tokens than the limiter's
-burst, which `NewLocalRateLimiter`'s own validation (`burstSize >=
-requestsPerSecond > 0`) makes structurally unreachable given a
-correctly-constructed limiter. These are kept as real checks rather than
-assumed away — the same judgment call `grnoti`'s own codebase documents in
-at least one place — not chased with contrived tests whose only purpose
-would be moving a coverage percentage.
+The SMTP sender is tested against a **real local Mailpit** (`t.Skip`-ing
+when it isn't reachable) as well as a fake `SMTPClient`; `-race` is
+mandatory. The Resend sender is tested against a local `httptest` fake of
+its API, plus one live test that runs only with `GRPOP_TEST_RESEND_API_KEY`
+set. The Meta Cloud API client is the one documented exception
+(§3.7): a fake client for the sender's wiring, an `httptest.Server` for the
+real HTTP client. `make coverage-check` gates the package at 95%.

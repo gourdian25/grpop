@@ -2,6 +2,117 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.0] - Unreleased
+
+**Breaking: grpop is delivery only.** A sender sends one message once and
+reports what the vendor said; grpop keeps nothing and retries nothing.
+Retrying, keeping a message durably and suppressing duplicates are the
+caller's (decided 2026-10-23 for grsentry's email work, which does all three
+with an outbox; see `docs/plan/2026-10-23-grpop-delivery-only.md`). An
+earlier draft of this version, never tagged, moved the Mongo dead-letter
+backend to `mongo-driver/v2`; that backend is now removed.
+
+### Added
+
+- `ErrPermanent`, `ErrInvalidAddress`, `MetaCloudDispatcherDeps.GraphAPIVersion`,
+  `EmailMessage.IdempotencyKey`, `NewResendDispatcher`/`ResendDispatcherDeps`.
+- Typed WhatsApp values: `WhatsAppMessage.Header`, `Body` and `Buttons`;
+  `WhatsAppParameter`, `WhatsAppCurrency`, `WhatsAppDateTime`,
+  `WhatsAppMedia` (`WhatsAppMediaKind`), `WhatsAppLocation`, `WhatsAppButton`
+  (`WhatsAppButtonKind`: URL, quick reply, copy code, one-time code); the
+  constructors `WhatsAppText`, `WhatsAppNamedText`, `WhatsAppImage`,
+  `WhatsAppVideo`, `WhatsAppDocument` and `WhatsAppOTP`.
+- `ErrInvalidPhoneNumber` and `ErrWhatsAppParameterInvalid`, both permanent.
+- `NewMetaCloudAPIClient(MetaCloudAPIClientConfig)`: the real Graph API
+  client, exported so one client serves a sender and a `TemplateValidator`
+  (before, a caller had no way to build a validator against Meta).
+- `WhatsAppTemplateInfo.Named`, `HeaderFormat`, `HeaderParameters`,
+  `BodyParameters` and `Buttons` (`WhatsAppTemplateButton`).
+
+### Removed
+
+- `WhatsAppMessage.TemplateVariables` and
+  `WhatsAppCloudAPIRequest.TemplateVariables`: `Body` replaces them.
+- `WhatsAppTemplateInfo.ParameterCount`: `BodyParameters` replaces it.
+- `Service`, `NewService`, `ServiceDeps`, `ServiceConfig`,
+  `DefaultServiceConfig`, `SendOptions` and `SendResult.Duplicate`.
+- `IdempotencyStore` and `NewCacheIdempotencyStore`.
+- `DLQHandler` and its three backends (`NewMemoryDLQHandler`,
+  `NewPostgresDLQHandler`, `NewMongoDLQHandler`), the `grpop_dlq` schema,
+  `PostgresConfig`, the `DLQ*` types, and `MessageEncryptor`.
+- The lifecycle events (`TopicMessageSent`, `TopicMessageFailed`,
+  `PublishMessageSent`, `PublishMessageFailed`).
+- grpop's own rate limiters (`NewLocalRateLimiter`, `NewRedisRateLimiter`)
+  and `RateLimiterStats`.
+- `ErrClosed`, `ErrBackendUnavailable`, `ErrIdempotencyKeyRequired`,
+  `ErrDLQEventNotFound`, `ErrDLQEventNotClaimed`; `Metrics.IncDLQPublished`
+  and `Metrics.IncIdempotencyDedupHit`.
+- Every third-party dependency: pgx, mongo-driver, go-redis, grcache,
+  grevents and `golang.org/x/time`.
+
+### Changed
+
+- `RateLimiter` is now `Allow(ctx context.Context, key string) (bool, error)`,
+  the method set of grsentry's `pkg/grlimiter.Limiter`, so that limiter
+  plugs in as it is. Each sender's deps take two, both optional:
+  `RateLimiter` (key: the channel) and `RecipientRateLimiter` (key: the
+  channel and a SHA-256 of the recipient). A refused send returns
+  `ErrRateLimited` at once instead of waiting for a token; a limiter error
+  stops the send. `Metrics.IncRateLimitRejected` now counts refusals.
+- `make docker-up`/`docker-down` start and stop Mailpit only.
+- **`ErrPermanent`:** every failure that will recur on every attempt
+  matches it (the validation sentinels, a template that won't render, an
+  SMTP `5xx` reply, a Meta refusal outside its retry-later codes, `429` and
+  `5xx`); everything else is temporary. Before, an SMTP `550` looked like a
+  network blip.
+- **Addresses:** `From`, `To` and `Reply-To` are parsed with `net/mail`; an
+  unparseable one or one carrying a CR or LF is `ErrInvalidAddress` (a
+  `Reply-To` with a line break used to add a header, such as a `Bcc`).
+  Display names are supported; `MAIL FROM`/`RCPT TO` take the bare address.
+  An invalid `SMTPDispatcherDeps.DefaultFrom` fails at construction.
+- **Logs:** the SMTP and dry-run senders log a recipient masked
+  (`a***@example.com`), also inside an SMTP reply that echoes it.
+- **A Resend sender:** `NewResendDispatcher(ResendDispatcherDeps)` sends
+  through Resend's HTTP API (hand-rolled, no SDK). `EmailMessage.IdempotencyKey`
+  goes as Resend's `Idempotency-Key`, so a retried message is sent once
+  within 24 hours; refusals are classed from Resend's error reference.
+- **One email preparation step:** every email sender checks, renders and
+  parses a message the same way (`prepareEmail`), so a second email vendor
+  sends exactly what the SMTP sender would.
+- **`EmailMessage.IdempotencyKey`:** optional, the same on every attempt at
+  one message. The SMTP sender makes the `Message-ID` its SHA-256, so a
+  retried message carries the same `Message-ID`; without a key it stays
+  random.
+- **WhatsApp messages carry every value kind Meta takes.** Before, only
+  positional body text could be sent, so no authentication (one-time code)
+  template could, and a gap in `TemplateVariables`' keys silently cut the
+  list. `WhatsAppMessage.To` must be in international form, and every value
+  is checked against Meta's send-time rules before the call.
+- **`TemplateValidator.Validate(ctx, msg WhatsAppMessage)`** takes the
+  message (was name, language and the variables map).
+- **The template validator is usable and keeps its promise:**
+  - the listing reads every page (it read one, so a template past it read
+    as unapproved), asks for `status=APPROVED`, and never sends the token
+    to a `paging.next` URL;
+  - placeholders are counted without the `{{20}}` cap, named ones included;
+  - a message is checked against the header, body and buttons
+    (`ErrWhatsAppTemplateArityMismatch` now says what differs);
+  - a failed listing no longer blocks sends: the last list is used, or the
+    send goes through;
+  - a refusal is checked against one new listing first (at most one per 30
+    seconds).
+- **The circuit breaker counts only temporary failures**, in every sender:
+  a permanent one is recorded as the vendor answering, so a run of bad
+  addresses no longer opens it. The SMTP sender classes a `5xx` inside the
+  breaker for this.
+- **The WhatsApp dry run** also logs whether there is a header and how many
+  body values and buttons there are, never a value.
+- **Meta Graph API version:** `MetaCloudDispatcherDeps.GraphAPIVersion`,
+  default `v26.0`. The hard-coded `v20.0` stopped being served on
+  2026-09-24.
+- `example/` sends through the SMTP sender with a caller-side retry loop on
+  `FullJitterBackoff`.
+
 ## [0.1.0] - 2026-07-31
 
 ### Added

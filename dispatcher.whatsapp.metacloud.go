@@ -10,24 +10,52 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 )
 
-const (
-	metaGraphAPIBaseURL = "https://graph.facebook.com"
-	metaGraphAPIVersion = "v20.0"
-)
+const metaGraphAPIBaseURL = "https://graph.facebook.com"
+
+// defaultMetaGraphAPIVersion is MetaCloudDispatcherDeps.GraphAPIVersion's
+// default: v26.0, the newest Graph API version (released 2026-07-29), read
+// from Meta's changelog on 2026-10-23. Meta keeps each version about two
+// years; v20.0, hard-coded here until then, stopped being available on
+// 2026-09-24. Bump it when Meta announces the next one's end date.
+const defaultMetaGraphAPIVersion = "v26.0"
+
+// metaGraphAPIVersionPattern is the shape of a Graph API version: "v",
+// major, ".", minor.
+var metaGraphAPIVersionPattern = regexp.MustCompile(`^v[0-9]+\.[0-9]+$`)
+
+// metaTemporaryErrorCodes are the Graph API error codes Meta's WhatsApp
+// Cloud API error reference says to retry after a wait (read 2026-10-23):
+// 2 (temporary downtime or overload), 4 (the app's call rate limit), 80007
+// (the account's rate limit), 130429 (message throughput limit), 131000
+// (unknown error), 131016 (service temporarily unavailable), 131056 (too
+// many messages to one recipient), 133004 (server temporarily
+// unavailable), 2494100 (the number in maintenance mode). doJSON treats
+// these, a 429 and any 5xx as temporary, and every other refusal (bad
+// parameters, permissions, an expired token, an unknown or paused
+// template, an undeliverable number, policy) as permanent.
+var metaTemporaryErrorCodes = map[int]bool{
+	2: true, 4: true, 80007: true, 130429: true, 131000: true,
+	131016: true, 131056: true, 133004: true, 2494100: true,
+}
 
 // WhatsAppCloudAPIRequest is grpop's own vendor-neutral shape for one
 // WhatsApp template send, translated from a WhatsAppMessage by
-// metaCloudDispatcher before reaching WhatsAppCloudAPIClient.
+// metaCloudDispatcher (after validateWhatsAppMessage) before reaching
+// WhatsAppCloudAPIClient.
 type WhatsAppCloudAPIRequest struct {
-	To                string
-	TemplateName      string
-	LanguageCode      string
-	TemplateVariables map[string]string
+	To           string
+	TemplateName string
+	LanguageCode string
+	Header       *WhatsAppParameter
+	Body         []WhatsAppParameter
+	Buttons      []WhatsAppButton
 }
 
 // WhatsAppCloudAPIResponse is the vendor-neutral result of one successful
@@ -76,14 +104,26 @@ type MetaCloudDispatcherDeps struct {
 	// to ctx's own deadline, whichever is sooner. Default: 10s.
 	RequestTimeout time.Duration
 
+	// GraphAPIVersion is the Graph API version every call names ("v26.0").
+	// Empty uses defaultMetaGraphAPIVersion. Meta retires a version about
+	// two years after release, so an operator can move ahead of grpop's
+	// default without a new grpop release.
+	GraphAPIVersion string
+
 	// Client is optional; nil constructs a real net/http-backed one from
-	// PhoneNumberID/BusinessAccountID/AccessToken/RequestTimeout.
+	// PhoneNumberID/BusinessAccountID/AccessToken/RequestTimeout. To check
+	// templates too, build the client once with NewMetaCloudAPIClient and
+	// pass it here and as MetaTemplateValidatorDeps.Client.
 	Client            WhatsAppCloudAPIClient
 	TemplateValidator TemplateValidator
-	RateLimiter       RateLimiter
-	CircuitBreaker    CircuitBreaker
-	Metrics           Metrics
-	Logger            Logger
+	// RateLimiter bounds the whole channel and RecipientRateLimiter each
+	// recipient (see RateLimiter's doc comment); both optional. A refusal
+	// is ErrRateLimited at once: Send never waits for a token.
+	RateLimiter          RateLimiter
+	RecipientRateLimiter RateLimiter
+	CircuitBreaker       CircuitBreaker
+	Metrics              Metrics
+	Logger               Logger
 }
 
 // metaCloudDispatcher implements WhatsAppSender over Meta's Graph API.
@@ -91,6 +131,7 @@ type metaCloudDispatcher struct {
 	client            WhatsAppCloudAPIClient
 	templateValidator TemplateValidator
 	rateLimiter       RateLimiter
+	recipientLimit    RateLimiter
 	circuitBreaker    CircuitBreaker
 	metrics           Metrics
 	logger            Logger
@@ -108,7 +149,7 @@ var _ WhatsAppSender = (*metaCloudDispatcher)(nil)
 // Returns:
 //   - WhatsAppSender
 //   - error: non-nil if deps.Client is nil and PhoneNumberID/AccessToken
-//     are not both set
+//     are not both set, or NewMetaCloudAPIClient refuses them
 func NewMetaCloudWhatsAppDispatcher(deps MetaCloudDispatcherDeps) (WhatsAppSender, error) {
 	client := deps.Client
 	if client == nil {
@@ -118,17 +159,24 @@ func NewMetaCloudWhatsAppDispatcher(deps MetaCloudDispatcherDeps) (WhatsAppSende
 		if deps.AccessToken == "" {
 			return nil, errors.New("grpop/metacloud: MetaCloudDispatcherDeps.AccessToken is required")
 		}
-		timeout := deps.RequestTimeout
-		if timeout <= 0 {
-			timeout = 10 * time.Second
+		var err error
+		client, err = NewMetaCloudAPIClient(MetaCloudAPIClientConfig{
+			PhoneNumberID:     deps.PhoneNumberID,
+			BusinessAccountID: deps.BusinessAccountID,
+			AccessToken:       deps.AccessToken,
+			GraphAPIVersion:   deps.GraphAPIVersion,
+			Timeout:           deps.RequestTimeout,
+		})
+		if err != nil {
+			return nil, err
 		}
-		client = newRealWhatsAppCloudAPIClient(deps.PhoneNumberID, deps.BusinessAccountID, deps.AccessToken, timeout)
 	}
 
 	return &metaCloudDispatcher{
 		client:            client,
 		templateValidator: deps.TemplateValidator,
 		rateLimiter:       deps.RateLimiter,
+		recipientLimit:    deps.RecipientRateLimiter,
 		circuitBreaker:    deps.CircuitBreaker,
 		metrics:           deps.Metrics,
 		logger:            OrNop(deps.Logger),
@@ -145,7 +193,7 @@ func (d *metaCloudDispatcher) Send(ctx context.Context, msg WhatsAppMessage) (Se
 	}
 
 	if d.templateValidator != nil {
-		if err := d.templateValidator.Validate(ctx, msg.TemplateName, msg.LanguageCode, msg.TemplateVariables); err != nil {
+		if err := d.templateValidator.Validate(ctx, msg); err != nil {
 			d.logger.Warn("grpop/metacloud: template validation failed", "template", msg.TemplateName, "error", err)
 			if d.metrics != nil {
 				d.metrics.IncSendResult(ChannelWhatsApp, SendStatusFailed)
@@ -154,18 +202,13 @@ func (d *metaCloudDispatcher) Send(ctx context.Context, msg WhatsAppMessage) (Se
 		}
 	}
 
-	if d.rateLimiter != nil {
-		if err := d.rateLimiter.Wait(ctx, ChannelWhatsApp, msg.To); err != nil {
-			return SendResult{}, fmt.Errorf("grpop/metacloud: rate limiter wait: %w", err)
-		}
+	if err := checkRateLimits(ctx, ChannelWhatsApp, msg.To, d.rateLimiter, d.recipientLimit, d.metrics); err != nil {
+		return SendResult{}, err
 	}
 
-	req := WhatsAppCloudAPIRequest{
-		To:                msg.To,
-		TemplateName:      msg.TemplateName,
-		LanguageCode:      msg.LanguageCode,
-		TemplateVariables: msg.TemplateVariables,
-	}
+	// The same fields as WhatsAppMessage, so a conversion: a field added to
+	// one and not the other stops this compiling.
+	req := WhatsAppCloudAPIRequest(msg)
 
 	var resp WhatsAppCloudAPIResponse
 	sendFn := func() error {
@@ -173,13 +216,7 @@ func (d *metaCloudDispatcher) Send(ctx context.Context, msg WhatsAppMessage) (Se
 		resp, sendErr = d.client.SendTemplateMessage(ctx, req)
 		return sendErr
 	}
-
-	var err error
-	if d.circuitBreaker != nil {
-		err = d.circuitBreaker.Execute(ctx, sendFn)
-	} else {
-		err = sendFn()
-	}
+	err := executeThroughBreaker(ctx, d.circuitBreaker, sendFn)
 
 	if d.metrics != nil {
 		d.metrics.ObserveSendLatency(ChannelWhatsApp, time.Since(start))
@@ -223,6 +260,7 @@ type metaCloudAPIClient struct {
 	phoneNumberID     string
 	businessAccountID string
 	accessToken       string
+	apiVersion        string
 	// baseURL defaults to metaGraphAPIBaseURL; overridable only by tests, so
 	// doJSON's request-building/response/error-envelope-parsing logic can be
 	// exercised against a real local httptest.Server instead of Meta itself.
@@ -231,27 +269,124 @@ type metaCloudAPIClient struct {
 
 var _ WhatsAppCloudAPIClient = (*metaCloudAPIClient)(nil)
 
-func newRealWhatsAppCloudAPIClient(phoneNumberID, businessAccountID, accessToken string, timeout time.Duration) *metaCloudAPIClient {
+// metaIDPattern is a Graph API object ID (a phone number ID, a business
+// account ID): digits only, so an ID can't add path segments of its own to
+// a URL that carries the access token.
+var metaIDPattern = regexp.MustCompile(`^[0-9]+$`)
+
+// MetaCloudAPIClientConfig configures NewMetaCloudAPIClient.
+type MetaCloudAPIClientConfig struct {
+	// PhoneNumberID is the sending number's ID, needed to send.
+	PhoneNumberID string
+	// BusinessAccountID is the WhatsApp Business Account's ID, needed to
+	// list its templates (GetApprovedTemplates, for a TemplateValidator).
+	BusinessAccountID string
+	// AccessToken is required; grpop never refreshes or rotates it.
+	AccessToken string
+	// GraphAPIVersion defaults to defaultMetaGraphAPIVersion.
+	GraphAPIVersion string
+	// Timeout bounds one Graph API call (each page of a listing is one).
+	// Default: 10s.
+	Timeout time.Duration
+}
+
+// NewMetaCloudAPIClient constructs the real WhatsAppCloudAPIClient over
+// Meta's Graph API. One client serves both a WhatsApp sender
+// (MetaCloudDispatcherDeps.Client) and a TemplateValidator
+// (MetaTemplateValidatorDeps.Client).
+//
+// Parameters:
+//   - cfg: MetaCloudAPIClientConfig — AccessToken and at least one of
+//     PhoneNumberID or BusinessAccountID are required
+//
+// Returns:
+//   - WhatsAppCloudAPIClient
+//   - error: non-nil if AccessToken is empty, both IDs are empty, an ID
+//     isn't digits only, or GraphAPIVersion isn't like v26.0
+func NewMetaCloudAPIClient(cfg MetaCloudAPIClientConfig) (WhatsAppCloudAPIClient, error) {
+	if cfg.AccessToken == "" {
+		return nil, errors.New("grpop/metacloud: MetaCloudAPIClientConfig.AccessToken is required")
+	}
+	if cfg.PhoneNumberID == "" && cfg.BusinessAccountID == "" {
+		return nil, errors.New("grpop/metacloud: MetaCloudAPIClientConfig needs a PhoneNumberID (to send) or a BusinessAccountID (to list templates)")
+	}
+	for _, id := range []struct{ name, value string }{{"PhoneNumberID", cfg.PhoneNumberID}, {"BusinessAccountID", cfg.BusinessAccountID}} {
+		if id.value != "" && !metaIDPattern.MatchString(id.value) {
+			return nil, fmt.Errorf("grpop/metacloud: MetaCloudAPIClientConfig.%s is not a Graph API ID (digits only)", id.name)
+		}
+	}
+	version := cfg.GraphAPIVersion
+	if version == "" {
+		version = defaultMetaGraphAPIVersion
+	}
+	if !metaGraphAPIVersionPattern.MatchString(version) {
+		return nil, fmt.Errorf("grpop/metacloud: GraphAPIVersion %q is not a Graph API version like v26.0", version)
+	}
+	timeout := cfg.Timeout
+	if timeout <= 0 {
+		timeout = 10 * time.Second
+	}
 	return &metaCloudAPIClient{
 		httpClient:        &http.Client{Timeout: timeout},
-		phoneNumberID:     phoneNumberID,
-		businessAccountID: businessAccountID,
-		accessToken:       accessToken,
+		phoneNumberID:     cfg.PhoneNumberID,
+		businessAccountID: cfg.BusinessAccountID,
+		accessToken:       cfg.AccessToken,
+		apiVersion:        version,
 		baseURL:           metaGraphAPIBaseURL,
-	}
+	}, nil
 }
 
 type metaLanguage struct {
 	Code string `json:"code"`
 }
 
+// metaTemplateParameter is one value of a send's components, holding the
+// field its Type names.
 type metaTemplateParameter struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
+	Type          string        `json:"type"`
+	ParameterName string        `json:"parameter_name,omitempty"`
+	Text          string        `json:"text,omitempty"`
+	Currency      *metaCurrency `json:"currency,omitempty"`
+	DateTime      *metaDateTime `json:"date_time,omitempty"`
+	Image         *metaMedia    `json:"image,omitempty"`
+	Video         *metaMedia    `json:"video,omitempty"`
+	Document      *metaMedia    `json:"document,omitempty"`
+	Location      *metaLocation `json:"location,omitempty"`
+	Payload       string        `json:"payload,omitempty"`
+	CouponCode    string        `json:"coupon_code,omitempty"`
 }
 
+type metaCurrency struct {
+	FallbackValue string `json:"fallback_value"`
+	Code          string `json:"code"`
+	Amount1000    int64  `json:"amount_1000"`
+}
+
+type metaDateTime struct {
+	FallbackValue string `json:"fallback_value"`
+}
+
+type metaMedia struct {
+	ID       string `json:"id,omitempty"`
+	Link     string `json:"link,omitempty"`
+	Filename string `json:"filename,omitempty"`
+}
+
+// metaLocation's coordinates are strings, as in Meta's own location header
+// example.
+type metaLocation struct {
+	Latitude  string `json:"latitude"`
+	Longitude string `json:"longitude"`
+	Name      string `json:"name,omitempty"`
+	Address   string `json:"address,omitempty"`
+}
+
+// metaTemplateComponent is a send's header, body or one button. A button
+// names its sub_type and its index, a string ("0").
 type metaTemplateComponent struct {
 	Type       string                  `json:"type"`
+	SubType    string                  `json:"sub_type,omitempty"`
+	Index      string                  `json:"index,omitempty"`
 	Parameters []metaTemplateParameter `json:"parameters"`
 }
 
@@ -289,16 +424,17 @@ func (c *metaCloudAPIClient) SendTemplateMessage(ctx context.Context, req WhatsA
 		To:               req.To,
 		Type:             "template",
 		Template: metaTemplatePayload{
-			Name:     req.TemplateName,
-			Language: metaLanguage{Code: req.LanguageCode},
+			Name:       req.TemplateName,
+			Language:   metaLanguage{Code: req.LanguageCode},
+			Components: metaTemplateComponents(req),
 		},
 	}
-	if params := positionalTemplateParameters(req.TemplateVariables); len(params) > 0 {
-		body.Template.Components = []metaTemplateComponent{{Type: "body", Parameters: params}}
-	}
 
-	url := fmt.Sprintf("%s/%s/%s/messages", c.baseURL, metaGraphAPIVersion, c.phoneNumberID)
-	respBody, err := c.doJSON(ctx, http.MethodPost, url, body)
+	if c.phoneNumberID == "" {
+		return WhatsAppCloudAPIResponse{}, permanent(errors.New("grpop/metacloud: a PhoneNumberID is required to send"))
+	}
+	endpoint := fmt.Sprintf("%s/%s/%s/messages", c.baseURL, c.apiVersion, c.phoneNumberID)
+	respBody, err := c.doJSON(ctx, http.MethodPost, endpoint, body)
 	if err != nil {
 		return WhatsAppCloudAPIResponse{}, err
 	}
@@ -313,81 +449,229 @@ func (c *metaCloudAPIClient) SendTemplateMessage(ctx context.Context, req WhatsA
 	return WhatsAppCloudAPIResponse{MessageID: parsed.Messages[0].ID}, nil
 }
 
-// positionalTemplateParameters converts req.TemplateVariables' stringified
-// positional keys ("1","2","3", ...) into Meta's ordered component
-// parameter list, stopping at the first missing key — Meta's template
-// parameters must be contiguous starting at "1", so a gap can't be
-// meaningfully represented as "skip this one."
-func positionalTemplateParameters(variables map[string]string) []metaTemplateParameter {
-	var params []metaTemplateParameter
-	for i := 1; ; i++ {
-		v, ok := variables[strconv.Itoa(i)]
-		if !ok {
-			break
-		}
-		params = append(params, metaTemplateParameter{Type: "text", Text: v})
+// metaTemplateComponents is req's header, body and buttons as Meta's send
+// takes them: a header component with its one value, a body component with
+// its values in order, and one button component per button. A template
+// with nothing to fill has no components (nil, left out of the JSON).
+func metaTemplateComponents(req WhatsAppCloudAPIRequest) []metaTemplateComponent {
+	var components []metaTemplateComponent
+	if req.Header != nil {
+		components = append(components, metaTemplateComponent{
+			Type: "header", Parameters: []metaTemplateParameter{metaParameter(*req.Header)},
+		})
 	}
-	return params
+	if len(req.Body) > 0 {
+		params := make([]metaTemplateParameter, 0, len(req.Body))
+		for _, p := range req.Body {
+			params = append(params, metaParameter(p))
+		}
+		components = append(components, metaTemplateComponent{Type: "body", Parameters: params})
+	}
+	for _, b := range req.Buttons {
+		components = append(components, metaButton(b))
+	}
+	return components
 }
+
+// metaParameter is p as Meta's typed parameter; p holds one value
+// (validateWhatsAppMessage), and a text value is the fallthrough.
+func metaParameter(p WhatsAppParameter) metaTemplateParameter {
+	param := metaTemplateParameter{ParameterName: p.Name}
+	switch {
+	case p.Currency != nil:
+		param.Type = "currency"
+		param.Currency = &metaCurrency{FallbackValue: p.Currency.FallbackValue, Code: p.Currency.Code, Amount1000: p.Currency.Amount1000}
+	case p.DateTime != nil:
+		param.Type = "date_time"
+		param.DateTime = &metaDateTime{FallbackValue: p.DateTime.FallbackValue}
+	case p.Media != nil:
+		media := &metaMedia{ID: p.Media.ID, Link: p.Media.Link, Filename: p.Media.Filename}
+		param.Type = string(p.Media.Kind)
+		switch p.Media.Kind {
+		case WhatsAppMediaImage:
+			param.Image = media
+		case WhatsAppMediaVideo:
+			param.Video = media
+		default:
+			param.Document = media
+		}
+	case p.Location != nil:
+		param.Type = "location"
+		param.Location = &metaLocation{
+			Latitude:  strconv.FormatFloat(p.Location.Latitude, 'f', -1, 64),
+			Longitude: strconv.FormatFloat(p.Location.Longitude, 'f', -1, 64),
+			Name:      p.Location.Name,
+			Address:   p.Location.Address,
+		}
+	default:
+		param.Type = "text"
+		param.Text = p.Text
+	}
+	return param
+}
+
+// metaButton is b as a button component. A one-time code goes as Meta's
+// "url" sub_type, as a URL suffix does: that is how Meta's copy-code and
+// one-tap authentication templates take it.
+func metaButton(b WhatsAppButton) metaTemplateComponent {
+	component := metaTemplateComponent{Type: "button", Index: strconv.Itoa(b.Index)}
+	switch b.Kind {
+	case WhatsAppButtonQuickReply:
+		component.SubType = "quick_reply"
+		component.Parameters = []metaTemplateParameter{{Type: "payload", Payload: b.Value}}
+	case WhatsAppButtonCopyCode:
+		component.SubType = "copy_code"
+		component.Parameters = []metaTemplateParameter{{Type: "coupon_code", CouponCode: b.Value}}
+	default:
+		component.SubType = "url"
+		component.Parameters = []metaTemplateParameter{{Type: "text", ParameterName: b.Name, Text: b.Value}}
+	}
+	return component
+}
+
+// The template listing reads metaTemplatePageSize templates a page, at most
+// metaTemplateMaxPages pages: 10,000 templates, past the 6,000 Meta lets
+// even a verified business keep, so a longer listing means something is
+// wrong and is an error rather than a cut-off list.
+const (
+	metaTemplatePageSize = 100
+	metaTemplateMaxPages = 100
+)
+
+// metaTemplatePlaceholder is a template text's placeholder: {{1}} in a
+// positional template, {{first_name}} in a named one, spaces inside the
+// braces tolerated.
+var metaTemplatePlaceholder = regexp.MustCompile(`\{\{\s*([A-Za-z0-9_]+)\s*\}\}`)
 
 type metaTemplateListResponse struct {
-	Data []struct {
-		Name       string `json:"name"`
-		Language   string `json:"language"`
-		Status     string `json:"status"`
-		Components []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		} `json:"components"`
-	} `json:"data"`
+	Data   []metaTemplate `json:"data"`
+	Paging struct {
+		Cursors struct {
+			After string `json:"after"`
+		} `json:"cursors"`
+		Next string `json:"next"`
+	} `json:"paging"`
 }
 
+type metaTemplate struct {
+	Name            string `json:"name"`
+	Language        string `json:"language"`
+	Status          string `json:"status"`
+	ParameterFormat string `json:"parameter_format"`
+	Components      []struct {
+		Type    string `json:"type"`
+		Format  string `json:"format"`
+		Text    string `json:"text"`
+		Buttons []struct {
+			Type    string `json:"type"`
+			URL     string `json:"url"`
+			OTPType string `json:"otp_type"`
+		} `json:"buttons"`
+	} `json:"components"`
+}
+
+// GetApprovedTemplates lists the business account's approved templates,
+// every page of them. It asks Meta for status=APPROVED and still drops any
+// other status itself. A next page is asked for with the cursor Meta gave
+// (after=), on this client's own base URL: the paging.next URL Meta also
+// gives is never fetched, so the access token only ever goes to the
+// configured host. A listing that repeats a cursor or runs past
+// metaTemplateMaxPages pages is an error.
 func (c *metaCloudAPIClient) GetApprovedTemplates(ctx context.Context) ([]WhatsAppTemplateInfo, error) {
 	if c.businessAccountID == "" {
-		return nil, errors.New("grpop/metacloud: MetaCloudDispatcherDeps.BusinessAccountID is required to list approved templates")
+		return nil, errors.New("grpop/metacloud: a BusinessAccountID is required to list approved templates")
 	}
-	url := fmt.Sprintf("%s/%s/%s/message_templates?fields=name,language,status,components&limit=200",
-		c.baseURL, metaGraphAPIVersion, c.businessAccountID)
-	respBody, err := c.doJSON(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, err
+	query := url.Values{
+		"fields": {"name,language,status,parameter_format,components"},
+		"status": {"APPROVED"},
+		"limit":  {strconv.Itoa(metaTemplatePageSize)},
 	}
-
-	var parsed metaTemplateListResponse
-	if err := json.Unmarshal(respBody, &parsed); err != nil {
-		return nil, fmt.Errorf("grpop/metacloud: decode template list: %w", err)
-	}
-
-	out := make([]WhatsAppTemplateInfo, 0, len(parsed.Data))
-	for _, t := range parsed.Data {
-		if t.Status != "APPROVED" {
-			continue
+	var out []WhatsAppTemplateInfo
+	for page := 0; page < metaTemplateMaxPages; page++ {
+		endpoint := fmt.Sprintf("%s/%s/%s/message_templates?%s", c.baseURL, c.apiVersion, c.businessAccountID, query.Encode())
+		respBody, err := c.doJSON(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
 		}
-		paramCount := 0
-		for _, comp := range t.Components {
-			if comp.Type == "BODY" {
-				paramCount = countTemplateParameters(comp.Text)
+		var parsed metaTemplateListResponse
+		if err := json.Unmarshal(respBody, &parsed); err != nil {
+			return nil, fmt.Errorf("grpop/metacloud: decode template list: %w", err)
+		}
+		for _, t := range parsed.Data {
+			if t.Status == "APPROVED" {
+				out = append(out, metaTemplateInfo(t))
 			}
 		}
-		out = append(out, WhatsAppTemplateInfo{Name: t.Name, LanguageCode: t.Language, ParameterCount: paramCount})
+
+		after := parsed.Paging.Cursors.After
+		if parsed.Paging.Next == "" || after == "" {
+			return out, nil
+		}
+		if after == query.Get("after") {
+			return nil, errors.New("grpop/metacloud: template list repeated a page cursor")
+		}
+		query.Set("after", after)
 	}
-	return out, nil
+	return nil, fmt.Errorf("grpop/metacloud: template list runs past %d pages", metaTemplateMaxPages)
 }
 
-// countTemplateParameters counts the highest positional placeholder
-// ("{{1}}", "{{2}}", ...) referenced in a template body's text, Meta's own
-// convention for how many parameters an approved template expects.
-func countTemplateParameters(bodyText string) int {
-	max := 0
-	for i := 1; i <= 20; i++ {
-		if strings.Contains(bodyText, "{{"+strconv.Itoa(i)+"}}") {
-			max = i
+// metaTemplateInfo reads what each part of t takes at send time. A template
+// without a parameter_format (one older than named parameters) is named
+// when any of its placeholders isn't a number.
+func metaTemplateInfo(t metaTemplate) WhatsAppTemplateInfo {
+	info := WhatsAppTemplateInfo{Name: t.Name, LanguageCode: t.Language}
+	for _, comp := range t.Components {
+		switch strings.ToUpper(comp.Type) {
+		case "HEADER":
+			info.HeaderFormat = strings.ToUpper(comp.Format)
+			if info.HeaderFormat == "TEXT" {
+				info.HeaderParameters = templatePlaceholders(comp.Text)
+			}
+		case "BODY":
+			info.BodyParameters = templatePlaceholders(comp.Text)
+		case "BUTTONS":
+			for i, b := range comp.Buttons {
+				kind := strings.ToUpper(b.Type)
+				info.Buttons = append(info.Buttons, WhatsAppTemplateButton{
+					Index: i,
+					Type:  kind,
+					// Meta lists a created one-time-code button as a URL
+					// (its url ending otp{{1}}, an otp_type kept), so
+					// either marks a URL that takes the code.
+					RequiresValue: kind == "COPY_CODE" || kind == "OTP" ||
+						(kind == "URL" && (metaTemplatePlaceholder.MatchString(b.URL) || b.OTPType != "")),
+				})
+			}
 		}
 	}
-	return max
+	switch strings.ToUpper(t.ParameterFormat) {
+	case "NAMED":
+		info.Named = true
+	case "":
+		for _, name := range append(append([]string(nil), info.HeaderParameters...), info.BodyParameters...) {
+			if strings.Trim(name, "0123456789") != "" {
+				info.Named = true
+			}
+		}
+	}
+	return info
 }
 
-func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, url string, payload any) ([]byte, error) {
+// templatePlaceholders is text's placeholders, each once, in order of first
+// appearance: "1", "2", ... or the names. Nothing caps a number.
+func templatePlaceholders(text string) []string {
+	var names []string
+	seen := make(map[string]bool)
+	for _, match := range metaTemplatePlaceholder.FindAllStringSubmatch(text, -1) {
+		if !seen[match[1]] {
+			seen[match[1]] = true
+			names = append(names, match[1])
+		}
+	}
+	return names
+}
+
+func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, endpoint string, payload any) ([]byte, error) {
 	var bodyReader io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
@@ -397,7 +681,7 @@ func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, url string, pay
 		bodyReader = bytes.NewReader(encoded)
 	}
 
-	httpReq, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	httpReq, err := http.NewRequestWithContext(ctx, method, endpoint, bodyReader)
 	if err != nil {
 		return nil, fmt.Errorf("grpop/metacloud: build request: %w", err)
 	}
@@ -419,11 +703,25 @@ func (c *metaCloudAPIClient) doJSON(ctx context.Context, method, url string, pay
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		var envelope metaErrorEnvelope
+		code := 0
+		var apiErr error
 		if json.Unmarshal(respBody, &envelope) == nil && envelope.Error.Message != "" {
-			return nil, fmt.Errorf("grpop/metacloud: graph api error (status %d, code %d): %s",
-				resp.StatusCode, envelope.Error.Code, envelope.Error.Message)
+			code = envelope.Error.Code
+			apiErr = fmt.Errorf("grpop/metacloud: graph api error (status %d, code %d): %s",
+				resp.StatusCode, code, envelope.Error.Message)
+		} else {
+			apiErr = fmt.Errorf("grpop/metacloud: graph api error: status %d", resp.StatusCode)
 		}
-		return nil, fmt.Errorf("grpop/metacloud: graph api error: status %d", resp.StatusCode)
+		if !metaErrorIsTemporary(resp.StatusCode, code) {
+			apiErr = permanent(apiErr)
+		}
+		return nil, apiErr
 	}
 	return respBody, nil
+}
+
+// metaErrorIsTemporary reports whether a Graph API refusal is worth another
+// attempt later: one of metaTemporaryErrorCodes, a 429, or a 5xx.
+func metaErrorIsTemporary(status, code int) bool {
+	return metaTemporaryErrorCodes[code] || status == http.StatusTooManyRequests || status >= 500
 }

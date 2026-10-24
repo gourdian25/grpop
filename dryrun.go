@@ -29,14 +29,14 @@ var _ EmailSender = (*dryRunEmailSender)(nil)
 // staging log for however long retention lasts.
 //
 // A construction-time swap (pick this instead of NewSMTPDispatcher when
-// building a staging ServiceDeps), not a runtime toggle inside the real
+// wiring a staging sender), not a runtime toggle inside the real
 // dispatcher — kept deliberately simple.
 //
 // Distinct from MemoryEmailSender (memory.go): that one exists for
 // contract/unit tests and deliberately DOES record full sends for
 // assertion (test-only, never wired into a shared log sink); this one
 // exists for a staging/pre-prod deployment that should never actually
-// deliver mail but should otherwise exercise the real Service pipeline.
+// deliver mail but should otherwise exercise the caller's real pipeline.
 func NewDryRunEmailSender(logger Logger) EmailSender {
 	return &dryRunEmailSender{logger: OrNop(logger)}
 }
@@ -45,7 +45,7 @@ func (s *dryRunEmailSender) Send(ctx context.Context, msg EmailMessage) (SendRes
 	if err := ctx.Err(); err != nil {
 		return SendResult{}, err
 	}
-	s.logger.Info("grpop/dryrun: email not sent (dry run)", "to", msg.To, "content", emailContentDescription(msg))
+	s.logger.Info("grpop/dryrun: email not sent (dry run)", "to", maskedRecipient(msg.To), "content", emailContentDescription(msg))
 	return SendResult{
 		Channel:           ChannelEmail,
 		ProviderMessageID: "dryrun-" + generateMemoryID(),
@@ -81,8 +81,8 @@ var _ WhatsAppSender = (*dryRunWhatsAppSender)(nil)
 // NewDryRunWhatsAppSender returns a WhatsAppSender that never contacts
 // Meta's Graph API. See NewDryRunEmailSender's doc comment for the full
 // rationale (redaction, construction-time-swap convention) — identical
-// here, substituting TemplateName (WhatsApp has no rendered body at all,
-// see WhatsAppMessage's own doc comment) for email's content-mode
+// here, substituting TemplateName and how many values the message fills
+// (never a value: a one-time code is one) for email's content-mode
 // description, and masking the recipient phone number the same way
 // dispatcher.whatsapp.metacloud.go's own logging does.
 func NewDryRunWhatsAppSender(logger Logger) WhatsAppSender {
@@ -93,7 +93,8 @@ func (s *dryRunWhatsAppSender) Send(ctx context.Context, msg WhatsAppMessage) (S
 	if err := ctx.Err(); err != nil {
 		return SendResult{}, err
 	}
-	s.logger.Info("grpop/dryrun: whatsapp not sent (dry run)", "to", maskPhoneNumber(msg.To), "template", msg.TemplateName)
+	s.logger.Info("grpop/dryrun: whatsapp not sent (dry run)", "to", maskPhoneNumber(msg.To), "template", msg.TemplateName,
+		"header", msg.Header != nil, "body_values", len(msg.Body), "buttons", len(msg.Buttons))
 	return SendResult{
 		Channel:           ChannelWhatsApp,
 		ProviderMessageID: "dryrun-" + generateMemoryID(),

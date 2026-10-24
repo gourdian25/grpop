@@ -11,9 +11,9 @@ linters:
   settings:
     revive:
       rules:
-        # EmailSender, WhatsAppSender, DLQHandler, RateLimiter, Logger, and
-        # grcache.Cache/grevents.Bus are fixed interface shapes — test
-        # doubles and backend constructors legitimately don't need every
+        # EmailSender, WhatsAppSender, RateLimiter and Logger are fixed
+        # interface shapes — test doubles and constructors legitimately
+        # don't need every
         # parameter, and dropping the name would make call sites harder to
         # read against the interface they're implementing.
         - name: unused-parameter
