@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file.
 
-## [0.2.0] - Unreleased
+## [0.2.0] - 2026-10-24
 
 **Breaking: grpop is delivery only.** A sender sends one message once and
 reports what the vendor said; grpop keeps nothing and retries nothing.
