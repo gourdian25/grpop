@@ -14,8 +14,8 @@ Decided 2026-10-23, for grsentry's M1 (the real email consumer). One stage per "
 | P4 | The Resend sender over `net/http` (no SDK) | **Done** 2026-10-24 |
 | P5 | WhatsApp messages: typed components (header, body, buttons; named or positional), the OTP helper, phone and value checks, and the breaker counting only temporary failures | **Done** 2026-10-24 |
 | P6 | The template validator, usable and truthful: an exported Meta client, paginated listing, component-aware counts, advisory when the listing fails; a live Meta smoke test | **Done** 2026-10-24 (live test unrun: needs the user's Meta keys) |
-| *grsentry* | M1a–M1d on this untagged grpop through grsentry's temporary `replace github.com/gourdian25/grpop => ../grpop` (2026-10-24, the user's choice over a pushed pseudo-version: no push needed; grsentry's CI can't build it, so grsentry isn't pushed or tagged until P7). A change M1 needs here becomes a stage of its own | **Next** |
-| P7 | Release `v0.2.0` once grsentry runs on it and grpop needs nothing more: the CHANGELOG dated, `make prerelease`, the user tags; grsentry drops the `replace` and requires the tag | To do, last |
+| *grsentry* | M1a–M1d on this untagged grpop through grsentry's temporary `replace github.com/gourdian25/grpop => ../grpop` (2026-10-24, the user's choice over a pushed pseudo-version: no push needed; grsentry's CI can't build it, so grsentry isn't pushed or tagged until P7). A change M1 needs here becomes a stage of its own | **Done** 2026-10-24: grsentry sends its email over grpop's SMTP sender (M1c) and proves it against a Mailpit (M1d); it needed no grpop change |
+| P7 | Release `v0.2.0` once grsentry runs on it and grpop needs nothing more: the CHANGELOG dated, `make prerelease`, the user tags; grsentry drops the `replace` and requires the tag | **Ready to tag** 2026-10-24 (the CHANGELOG dated, the README's status, `make prerelease` green; the Resend and Meta live tests not run: no keys). The user tags |
 
 ## The decisions (the user's, 2026-10-23)
 

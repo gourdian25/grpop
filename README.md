@@ -17,10 +17,13 @@ grpop is **not** an email-retrieval/POP3 library despite the name, and
 of "user" or "preferences"; it's about delivery, not identity — the
 recipient address/number is supplied per-send by the caller.
 
-Status: being reshaped to delivery only, then given a Resend sender
-([docs/plan/2026-10-23-grpop-delivery-only.md](docs/plan/2026-10-23-grpop-delivery-only.md)).
-`v0.1.0` had an orchestrating `Service` with an idempotency store and a
-dead-letter retry table; they are gone (see
+Status: `v0.2.0` (2026-10-24), delivery only: an SMTP sender, a Resend
+sender and a WhatsApp (Meta Cloud API) sender, each sending one message once
+and saying whether it was accepted, refused for good or failed for now
+([docs/plan/2026-10-23-grpop-delivery-only.md](docs/plan/2026-10-23-grpop-delivery-only.md);
+the changes are in [CHANGELOG.md](CHANGELOG.md)). grsentry's email outbox
+sends through it. `v0.1.0` had an orchestrating `Service` with an
+idempotency store and a dead-letter retry table; they are gone (see
 [Delivery only](#delivery-only)).
 
 ## Table of Contents
