@@ -53,7 +53,7 @@ func main() {
 	defer func() { _ = emailSender.Close() }()
 
 	ctx := context.Background()
-	const appName = "Skipp"
+	const appName = "Example App"
 	const tenantName = "Acme Corp"
 	now := time.Now()
 
@@ -64,7 +64,7 @@ func main() {
 		TemplateData: map[string]any{
 			"AppName":          appName,
 			"RecipientName":    "Ada",
-			"ResetLink":        "https://app.skipp.co.in/reset-password?token=example-reset-token",
+			"ResetLink":        "https://app.example.com/reset-password?token=example-reset-token",
 			"ExpiresInMinutes": 30,
 		},
 	}, now.Add(30*time.Minute)) // the reset link's own expiry: retrying past it delivers a dead link
@@ -77,7 +77,7 @@ func main() {
 			"AppName":        appName,
 			"TenantName":     tenantName,
 			"IntroLine":      fmt.Sprintf(inviteIntroLineForProviderInvite, tenantName),
-			"InviteLink":     "https://app.skipp.co.in/invite/accept?token=example-provider-invite-token",
+			"InviteLink":     "https://app.example.com/invite/accept?token=example-provider-invite-token",
 			"ExpiresInHours": 72,
 		},
 	}, now.Add(72*time.Hour))
@@ -90,7 +90,7 @@ func main() {
 			"AppName":        appName,
 			"TenantName":     tenantName,
 			"IntroLine":      fmt.Sprintf(inviteIntroLineForAdminInvite, tenantName),
-			"InviteLink":     "https://app.skipp.co.in/invite/accept?token=example-admin-invite-token",
+			"InviteLink":     "https://app.example.com/invite/accept?token=example-admin-invite-token",
 			"ExpiresInHours": 72,
 		},
 	}, now.Add(72*time.Hour))
@@ -103,7 +103,7 @@ func main() {
 			"AppName":        appName,
 			"TenantName":     tenantName,
 			"IntroLine":      fmt.Sprintf(inviteIntroLineForTenantFirstAdmin, tenantName),
-			"InviteLink":     "https://app.skipp.co.in/invite/accept?token=example-first-admin-invite-token",
+			"InviteLink":     "https://app.example.com/invite/accept?token=example-first-admin-invite-token",
 			"ExpiresInHours": 72,
 		},
 	}, now.Add(72*time.Hour))

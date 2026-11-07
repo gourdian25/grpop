@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.2.1] - 2026-11-08
+
+### Changed
+
+- Licence: standard MIT text, copyright holder Manish Kumar. No change to the terms granted.
+- README: updated the status line.
+- `example/` uses a placeholder app name and `example.com` links.
+- `docs/plan/grpop-plan.md` describes its requirements generically.
+
 ## [0.2.0] - 2026-10-24
 
 **Breaking: grpop is delivery only.** A sender sends one message once and
